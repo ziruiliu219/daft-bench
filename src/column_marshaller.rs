@@ -79,7 +79,9 @@ pub fn compute_varchar_serialized_size(data: *const u8) -> usize {
 }
 
 /// Compare varchar stored in arena format against input bytes. Returns true if equal.
-/// Mirrors C++ `TaperColumnSerializeHandler::CompareVarcharFromRow`.
+/// Mirrors C++ `TaperColumnSerializeHandler::CompareVarcharFromRow`:
+///   return memcmp(rowDataPtr, sv.data(), stringLen) == 0;
+/// Uses slice equality which compiles to memcmp — identical to OmniOperator.
 #[inline]
 pub fn compare_varchar_from_row(arena_ptr: *const u8, input: &[u8]) -> bool {
     unsafe {
@@ -93,41 +95,9 @@ pub fn compare_varchar_from_row(arena_ptr: *const u8, input: &[u8]) -> bool {
         if string_len != input.len() { return false; }
         if string_len == 0 { return true; }
         let data_ptr = arena_ptr.add(1 + row_len_size as usize);
-        #[cfg(target_arch = "aarch64")]
-        {
-            #[cfg(debug_assertions)]
-            {
-                use std::sync::atomic::{AtomicBool, Ordering};
-                static LOGGED: AtomicBool = AtomicBool::new(false);
-                if !LOGGED.swap(true, Ordering::Relaxed) {
-                    eprintln!("[SIMD] compare_varchar_from_row: using NEON (vceqq_u8, 16B/iter)");
-                }
-            }
-            compare_bytes_neon(data_ptr, input.as_ptr(), string_len)
-        }
-        #[cfg(not(target_arch = "aarch64"))]
-        { std::slice::from_raw_parts(data_ptr, string_len) == input }
+        // mirrors: return memcmp(rowDataPtr, sv.data(), stringLen) == 0;
+        std::slice::from_raw_parts(data_ptr, string_len) == input
     }
-}
-
-/// NEON-accelerated byte comparison. Mirrors C++ `StringRef::operator==` NEON path.
-#[cfg(target_arch = "aarch64")]
-#[inline]
-unsafe fn compare_bytes_neon(left: *const u8, right: *const u8, len: usize) -> bool {
-    use std::arch::aarch64::*;
-    let mut i = 0usize;
-    while i + 16 <= len {
-        let lhs_vec = vld1q_u8(left.add(i));
-        let rhs_vec = vld1q_u8(right.add(i));
-        let cmp_result = vceqq_u8(lhs_vec, rhs_vec);
-        let cmp_wide: uint64x2_t = vreinterpretq_u64_u8(cmp_result);
-        if vgetq_lane_u64::<0>(cmp_wide) != !0u64 || vgetq_lane_u64::<1>(cmp_wide) != !0u64 {
-            return false;
-        }
-        i += 16;
-    }
-    while i < len { if *left.add(i) != *right.add(i) { return false; } i += 1; }
-    true
 }
 
 /// Read varchar pointer from a row. Mirrors C++ `*reinterpret_cast<char**>(row + offset)`.
