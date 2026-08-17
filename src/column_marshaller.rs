@@ -415,43 +415,11 @@ impl TaperColumnSerializeHandler {
             },
         );
 
-        // Step 4
+        // Step 4: GetUnequalsNumWithDecode — mirrors C++ method of same name
         let count = self.update_indices.len();
         if count == 0 { return; }
         let mut working_indices = std::mem::take(&mut self.update_indices);
-        let num_varchar = self.varchar_col_indices.len();
-        if self.use_merged && num_varchar > 0 {
-            let max_idx = *working_indices[..count].iter().max().unwrap_or(&0) as usize;
-            let cache_size = (max_idx + 1) * num_varchar;
-            self.merged_cache.resize(cache_size, std::ptr::null());
-            unsafe { std::ptr::write_bytes(self.merged_cache.as_mut_ptr(), 0, cache_size); }
-            let mut out_ptrs = vec![std::ptr::null::<u8>(); num_varchar];
-            for wi in 0..count {
-                let idx = working_indices[wi] as usize;
-                get_all_merged_varchar_ptrs(self.groups[idx], self.varchar_slot_col_offset, &self.varchar_col_descs, &mut out_ptrs);
-                for vc in 0..num_varchar { self.merged_cache[idx * num_varchar + vc] = out_ptrs[vc]; }
-            }
-        }
-        let mut idx_from = 0usize;
-        for (col_idx, desc) in self.col_descs.iter().enumerate() {
-            if idx_from >= count { break; }
-            let remaining = count - idx_from;
-            match desc {
-                ColumnDesc::Int64 => {
-                    let input = match &columns[col_idx] { ColumnInput::Int64(v) => *v, _ => panic!("") };
-                    idx_from += batch_compare_decoded_i64(&mut working_indices[idx_from..], remaining, input, &self.groups, self.col_offsets[col_idx]);
-                }
-                ColumnDesc::Varchar => {
-                    let input = match &columns[col_idx] { ColumnInput::Varchar(v) => *v, _ => panic!("") };
-                    if self.use_merged && num_varchar > 1 {
-                        let vc_pos = self.varchar_col_indices.iter().position(|&c| c == col_idx).unwrap();
-                        idx_from += batch_compare_varchar_decoded_cached(&mut working_indices[idx_from..], remaining, input, &self.merged_cache, num_varchar, vc_pos);
-                    } else {
-                        idx_from += batch_compare_varchar_decoded(&mut working_indices[idx_from..], remaining, input, &self.groups, self.col_offsets[col_idx]);
-                    }
-                }
-            }
-        }
+        let idx_from = self.get_unequals_num_with_decode(&mut working_indices, count, columns);
 
         // Step 5
         for ui in 0..idx_from {
@@ -485,5 +453,68 @@ impl TaperColumnSerializeHandler {
             unsafe { *(rp.add(self.agg_offset) as *mut i64) += agg_values[row_idx]; }
         }
         self.update_indices = working_indices;
+    }
+
+    /// Mirrors C++ `TaperColumnSerializeHandler::GetUnequalsNumWithDecode`.
+    #[inline(never)]
+    fn get_unequals_num_with_decode(
+        &mut self, working_indices: &mut [u32], count: usize, columns: &[ColumnInput],
+    ) -> usize {
+        let num_varchar = self.varchar_col_indices.len();
+
+        // Build merged varchar cache
+        if self.use_merged && num_varchar > 0 {
+            let max_idx = *working_indices[..count].iter().max().unwrap_or(&0) as usize;
+            let cache_size = (max_idx + 1) * num_varchar;
+            self.merged_cache.resize(cache_size, std::ptr::null());
+            unsafe { std::ptr::write_bytes(self.merged_cache.as_mut_ptr(), 0, cache_size); }
+            let mut out_ptrs = vec![std::ptr::null::<u8>(); num_varchar];
+            for wi in 0..count {
+                let idx = working_indices[wi] as usize;
+                get_all_merged_varchar_ptrs(
+                    self.groups[idx], self.varchar_slot_col_offset,
+                    &self.varchar_col_descs, &mut out_ptrs,
+                );
+                for vc in 0..num_varchar {
+                    self.merged_cache[idx * num_varchar + vc] = out_ptrs[vc];
+                }
+            }
+        }
+
+        let mut idx_from = 0usize;
+        for (col_idx, desc) in self.col_descs.iter().enumerate() {
+            if idx_from >= count { break; }
+            let remaining = count - idx_from;
+            match desc {
+                ColumnDesc::Int64 => {
+                    let input = match &columns[col_idx] {
+                        ColumnInput::Int64(v) => *v, _ => panic!("")
+                    };
+                    idx_from += batch_compare_decoded_i64(
+                        &mut working_indices[idx_from..], remaining,
+                        input, &self.groups, self.col_offsets[col_idx],
+                    );
+                }
+                ColumnDesc::Varchar => {
+                    let input = match &columns[col_idx] {
+                        ColumnInput::Varchar(v) => *v, _ => panic!("")
+                    };
+                    if self.use_merged && num_varchar > 1 {
+                        let vc_pos = self.varchar_col_indices.iter()
+                            .position(|&c| c == col_idx).unwrap();
+                        idx_from += batch_compare_varchar_decoded_cached(
+                            &mut working_indices[idx_from..], remaining,
+                            input, &self.merged_cache, num_varchar, vc_pos,
+                        );
+                    } else {
+                        idx_from += batch_compare_varchar_decoded(
+                            &mut working_indices[idx_from..], remaining,
+                            input, &self.groups, self.col_offsets[col_idx],
+                        );
+                    }
+                }
+            }
+        }
+        idx_from
     }
 }
