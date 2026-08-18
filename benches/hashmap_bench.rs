@@ -174,7 +174,7 @@ fn generate_mixed_data(
 
 #[inline(never)]
 fn run_taper_mixed(data: &MixedBenchData, num_chunks: usize) {
-    const BATCH_SIZE: usize = 4096;
+    const BATCH_SIZE: usize = 410;
 
     // Build schema
     let mut col_descs: Vec<ColumnDesc> = Vec::new();
@@ -278,7 +278,7 @@ fn build_arrow_arrays(data: &MixedBenchData) -> Vec<ArrayRef> {
 
 #[inline(never)]
 fn run_daft_mixed(data: &MixedBenchData, ht_size: usize, arrays: &[ArrayRef]) {
-    const BATCH_SIZE: usize = 4096;
+    const BATCH_SIZE: usize = 410;
 
     let mut table = HashMap::<IndexHash, u32, IdentityBuildHasher>::with_capacity_and_hasher(ht_size, Default::default());
     let mut ngroups: u32 = 0;
