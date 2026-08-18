@@ -19,6 +19,9 @@ pub struct TaperHashMap {
     num_chunks: usize,
     size: usize,
     mask: usize, // num_chunks - 1 (power of 2)
+    emplace_hash_vals: Vec<u64>,
+    emplace_positions: Vec<usize>,
+    emplace_collisions: Vec<u32>,
 }
 
 impl Drop for TaperHashMap {
@@ -56,6 +59,9 @@ impl TaperHashMap {
             num_chunks,
             mask: num_chunks - 1,
             size: 0,
+            emplace_hash_vals: Vec::new(),
+            emplace_positions: Vec::new(),
+            emplace_collisions: Vec::new(),
         }
     }
 
@@ -81,6 +87,17 @@ impl TaperHashMap {
 
     pub fn num_chunks(&self) -> usize {
         self.num_chunks
+    }
+
+    /// Ensure at least `min_slots` slot capacity while preserving existing entries.
+    ///
+    /// This is the multi-batch-safe counterpart to constructing a new map with
+    /// `with_slot_capacity`. Omni expands by rehashing existing entries; replacing
+    /// the map would lose groups already accumulated by earlier batches.
+    pub fn reserve_slot_capacity(&mut self, min_slots: usize) {
+        while self.capacity() < min_slots {
+            self.expand();
+        }
     }
 
     #[inline(always)]
@@ -289,10 +306,21 @@ impl TaperHashMap {
             return;
         }
 
-        // ResetEmplaceContext: precompute hash values and chunk positions
-        let mut emplace_hash_vals: Vec<u64> = hashes.iter().map(|&h| h).collect(); // Hash(key)=key for KeyScattered
-        let mut emplace_positions: Vec<usize> = emplace_hash_vals.iter().map(|&h| self.chunk_pos(h)).collect();
-        let mut emplace_collisions: Vec<u32> = vec![0u32; num_rows];
+        // ResetEmplaceContext: reuse hash/position/collision buffers across batches.
+        let mut emplace_hash_vals = std::mem::take(&mut self.emplace_hash_vals);
+        let mut emplace_positions = std::mem::take(&mut self.emplace_positions);
+        let mut emplace_collisions = std::mem::take(&mut self.emplace_collisions);
+        emplace_hash_vals.clear();
+        emplace_positions.clear();
+        emplace_collisions.clear();
+        emplace_hash_vals.resize(num_rows, 0);
+        emplace_positions.resize(num_rows, 0);
+        emplace_collisions.resize(num_rows, 0);
+        for i in 0..num_rows {
+            let h = hashes[i];
+            emplace_hash_vals[i] = h;
+            emplace_positions[i] = self.chunk_pos(h);
+        }
 
         let mut collision_batch: usize = 1;
         let mut collision_count: usize = 0;
@@ -364,8 +392,13 @@ impl TaperHashMap {
                 for idx in 0..cur_count {
                     prefetch_idx(&emplace_positions, idx, cur_count, $self.chunks);
                     let row_idx = emplace_collisions[idx] as usize;
-                    // During rehashed collisions, just try once (guaranteed to succeed post-expand)
-                    try_emplace_at_pos!($self, hashes[row_idx], emplace_positions[idx], row_idx);
+                    let ok = try_emplace_at_pos!($self, emplace_hash_vals[idx], emplace_positions[idx], row_idx);
+                    if !ok {
+                        emplace_collisions[collision_count] = row_idx as u32;
+                        emplace_hash_vals[collision_count] = emplace_hash_vals[idx];
+                        emplace_positions[collision_count] = $self.rehash_pos(1, emplace_positions[idx]);
+                        collision_count += 1;
+                    }
                 }
             }};
         }
@@ -421,6 +454,10 @@ impl TaperHashMap {
                 }
             }
         }
+
+        self.emplace_hash_vals = emplace_hash_vals;
+        self.emplace_positions = emplace_positions;
+        self.emplace_collisions = emplace_collisions;
     }
 
     // ─── Two-stage batch emplace with SIMD key compare ──────────────────────────
@@ -819,3 +856,4 @@ mod tests {
         assert_eq!(map.capacity(), 128);
     }
 }
+

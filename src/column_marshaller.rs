@@ -79,9 +79,7 @@ pub fn compute_varchar_serialized_size(data: *const u8) -> usize {
 }
 
 /// Compare varchar stored in arena format against input bytes. Returns true if equal.
-/// Mirrors C++ `TaperColumnSerializeHandler::CompareVarcharFromRow`:
-///   return memcmp(rowDataPtr, sv.data(), stringLen) == 0;
-/// Uses slice equality which compiles to memcmp — identical to OmniOperator.
+/// Mirrors C++ `TaperColumnSerializeHandler::CompareVarcharFromRow`.
 #[inline]
 pub fn compare_varchar_from_row(arena_ptr: *const u8, input: &[u8]) -> bool {
     unsafe {
@@ -95,9 +93,41 @@ pub fn compare_varchar_from_row(arena_ptr: *const u8, input: &[u8]) -> bool {
         if string_len != input.len() { return false; }
         if string_len == 0 { return true; }
         let data_ptr = arena_ptr.add(1 + row_len_size as usize);
-        // mirrors: return memcmp(rowDataPtr, sv.data(), stringLen) == 0;
-        std::slice::from_raw_parts(data_ptr, string_len) == input
+        #[cfg(target_arch = "aarch64")]
+        {
+            #[cfg(debug_assertions)]
+            {
+                use std::sync::atomic::{AtomicBool, Ordering};
+                static LOGGED: AtomicBool = AtomicBool::new(false);
+                if !LOGGED.swap(true, Ordering::Relaxed) {
+                    eprintln!("[SIMD] compare_varchar_from_row: using NEON (vceqq_u8, 16B/iter)");
+                }
+            }
+            compare_bytes_neon(data_ptr, input.as_ptr(), string_len)
+        }
+        #[cfg(not(target_arch = "aarch64"))]
+        { std::slice::from_raw_parts(data_ptr, string_len) == input }
     }
+}
+
+/// NEON-accelerated byte comparison. Mirrors C++ `StringRef::operator==` NEON path.
+#[cfg(target_arch = "aarch64")]
+#[inline]
+unsafe fn compare_bytes_neon(left: *const u8, right: *const u8, len: usize) -> bool {
+    use std::arch::aarch64::*;
+    let mut i = 0usize;
+    while i + 16 <= len {
+        let lhs_vec = vld1q_u8(left.add(i));
+        let rhs_vec = vld1q_u8(right.add(i));
+        let cmp_result = vceqq_u8(lhs_vec, rhs_vec);
+        let cmp_wide: uint64x2_t = vreinterpretq_u64_u8(cmp_result);
+        if vgetq_lane_u64::<0>(cmp_wide) != !0u64 || vgetq_lane_u64::<1>(cmp_wide) != !0u64 {
+            return false;
+        }
+        i += 16;
+    }
+    while i < len { if *left.add(i) != *right.add(i) { return false; } i += 1; }
+    true
 }
 
 /// Read varchar pointer from a row. Mirrors C++ `*reinterpret_cast<char**>(row + offset)`.
@@ -258,6 +288,69 @@ pub fn store_key_one_row_from_decode(
     }
 }
 
+pub fn batch_store_merged_varchar_columns(
+    rc: &mut RowContainer,
+    rows: &[*mut u8],
+    row_indices: &[u32],
+    columns: &[ColumnInput],
+    varchar_col_indices: &[usize],
+    varchar_slot_col_idx: usize,
+) {
+    for (&row, &row_idx) in rows.iter().zip(row_indices.iter()) {
+        let row_idx = row_idx as usize;
+        let mut total_size = 0usize;
+        for &vc_idx in varchar_col_indices {
+            let data = match &columns[vc_idx] { ColumnInput::Varchar(v) => v[row_idx], _ => panic!("") };
+            total_size += 1 + compute_row_len_size(data.len()) as usize + data.len();
+        }
+
+        let block_start = rc.arena_alloc(total_size);
+        let mut write_pos = block_start;
+        for &vc_idx in varchar_col_indices {
+            let col = rc.column_at(vc_idx);
+            let data = match &columns[vc_idx] { ColumnInput::Varchar(v) => v[row_idx], _ => panic!("") };
+            RowContainer::clear_null_at(row, col.null_byte(), col.null_mask());
+            let written = serialize_varchar_to_buffer(write_pos, data);
+            write_pos = unsafe { write_pos.add(written) };
+        }
+
+        let slot_offset = rc.column_at(varchar_slot_col_idx).offset();
+        unsafe { (row.add(slot_offset) as *mut *const u8).write_unaligned(block_start as *const u8); }
+    }
+}
+
+pub fn batch_store_key_column_varchar(
+    rc: &mut RowContainer,
+    col_idx: usize,
+    rows: &[*mut u8],
+    row_indices: &[u32],
+    columns: &[ColumnInput],
+) {
+    let col = rc.column_at(col_idx);
+    for (&row, &row_idx) in rows.iter().zip(row_indices.iter()) {
+        let row_idx = row_idx as usize;
+        let data = match &columns[col_idx] { ColumnInput::Varchar(v) => v[row_idx], _ => panic!("") };
+        RowContainer::clear_null_at(row, col.null_byte(), col.null_mask());
+        variable_type_serializer(rc, row, col_idx, data);
+    }
+}
+
+pub fn batch_store_key_column_i64(
+    rc: &RowContainer,
+    col_idx: usize,
+    rows: &[*mut u8],
+    row_indices: &[u32],
+    columns: &[ColumnInput],
+) {
+    let col = rc.column_at(col_idx);
+    let values = match &columns[col_idx] { ColumnInput::Int64(v) => *v, _ => panic!("") };
+    for (&row, &row_idx) in rows.iter().zip(row_indices.iter()) {
+        let row_idx = row_idx as usize;
+        RowContainer::clear_null_at(row, col.null_byte(), col.null_mask());
+        RowContainer::store_value::<i64>(row, col.offset(), values[row_idx]);
+    }
+}
+
 /// Mirrors C++ `GetUnequalsNumWithDecode`.
 pub fn get_unequals_num_with_decode(
     working_indices: &mut [u32], count: usize, columns: &[ColumnInput],
@@ -317,6 +410,53 @@ pub fn compare_keys_with_decode(
     true
 }
 
+pub fn compare_keys_with_decode_layout(
+    row_ptr: *const u8,
+    row_idx: usize,
+    columns: &[ColumnInput],
+    col_descs: &[ColumnDesc],
+    col_offsets: &[usize],
+    varchar_col_indices: &[usize],
+    varchar_slot_col_offset: usize,
+    use_merged: bool,
+) -> bool {
+    let use_merged_varchar = use_merged && varchar_col_indices.len() > 1;
+    let mut merged_pos = if use_merged_varchar {
+        let block_ptr = read_varchar_ptr(row_ptr, varchar_slot_col_offset);
+        if block_ptr.is_null() {
+            return false;
+        }
+        block_ptr
+    } else {
+        std::ptr::null()
+    };
+
+    for (col_idx, desc) in col_descs.iter().enumerate() {
+        match desc {
+            ColumnDesc::Int64 => {
+                let stored: i64 = RowContainer::read_value::<i64>(row_ptr, col_offsets[col_idx]);
+                let input = match &columns[col_idx] { ColumnInput::Int64(v) => v[row_idx], _ => panic!("") };
+                if stored != input { return false; }
+            }
+            ColumnDesc::Varchar => {
+                let input = match &columns[col_idx] { ColumnInput::Varchar(v) => v[row_idx], _ => panic!("") };
+                if use_merged_varchar {
+                    if !compare_varchar_from_row(merged_pos, input) {
+                        return false;
+                    }
+                    let size = compute_varchar_serialized_size(merged_pos);
+                    merged_pos = unsafe { merged_pos.add(size) };
+                } else {
+                    let arena_ptr = read_varchar_ptr(row_ptr, col_offsets[col_idx]);
+                    if arena_ptr.is_null() || unsafe { *arena_ptr == 0 } { return false; }
+                    if !compare_varchar_from_row(arena_ptr, input) { return false; }
+                }
+            }
+        }
+    }
+    true
+}
+
 // ═══════════════════════════════════════════════════════════════════════════════
 // TaperColumnSerializeHandler struct
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -335,7 +475,10 @@ pub struct TaperColumnSerializeHandler {
     // Reusable buffers (mirrors C++ class members)
     groups: Vec<*const u8>,
     update_indices: Vec<u32>,
+    new_groups: Vec<*mut u8>,
+    new_group_row_indices: Vec<u32>,
     merged_cache: Vec<*const u8>,
+    merged_out_ptrs: Vec<*const u8>,
 }
 
 impl TaperColumnSerializeHandler {
@@ -363,11 +506,20 @@ impl TaperColumnSerializeHandler {
             map: TaperHashMap::with_capacity(initial_capacity), rc,
             col_descs: columns.to_vec(), col_offsets, agg_offset,
             varchar_col_indices, varchar_slot_col_idx, use_merged, varchar_col_descs, varchar_slot_col_offset,
-            groups: Vec::new(), update_indices: Vec::new(), merged_cache: Vec::new(),
+            groups: Vec::new(),
+            update_indices: Vec::new(),
+            new_groups: Vec::new(),
+            new_group_row_indices: Vec::new(),
+            merged_cache: Vec::new(),
+            merged_out_ptrs: Vec::new(),
         }
     }
 
     pub fn num_groups(&self) -> usize { self.rc.num_rows() }
+
+    pub fn aggregate_i64_checksum(&self) -> i64 {
+        self.rc.agg_i64_checksum(self.agg_offset)
+    }
 
     /// Mirrors C++ `EmplaceTableWithDecode`.
     pub fn emplace_table_with_decode(&mut self, hashes: &[u64], columns: &[ColumnInput], agg_values: &[i64]) {
@@ -375,25 +527,23 @@ impl TaperColumnSerializeHandler {
         let n = hashes.len();
         if n == 0 { return; }
 
-        // No capacity check here — caller must pass sufficient initial_capacity
-        // to TaperColumnSerializeHandler::new() so that no rehash occurs.
-        // This matches rust-taper-hashmap2 behavior.
+        // Ensure batch-capacity without discarding groups from earlier batches.
+        self.map.reserve_slot_capacity(n);
 
         // Reuse buffers (mirrors C++ class member resize pattern)
         self.groups.resize(n, std::ptr::null());
         unsafe { std::ptr::write_bytes(self.groups.as_mut_ptr(), 0, n); }
         self.update_indices.clear();
+        self.new_groups.clear();
+        self.new_group_row_indices.clear();
 
-        // Step 2+3
+        // Step 2: insert/probe and collect new groups. Key materialization is
+        // deferred to the batch store phase below, matching Omni-Orig.
         let rc_ptr = &mut self.rc as *mut RowContainer;
-        let col_offsets = &self.col_offsets as *const Vec<usize>;
-        let col_descs = &self.col_descs as *const Vec<ColumnDesc>;
-        let varchar_col_indices = &self.varchar_col_indices as *const Vec<usize>;
-        let varchar_slot_col_idx = self.varchar_slot_col_idx;
-        let use_merged = self.use_merged;
-        let agg_offset = self.agg_offset;
         let groups_ptr = self.groups.as_mut_ptr();
         let update_indices_ptr = &mut self.update_indices as *mut Vec<u32>;
+        let new_groups_ptr = &mut self.new_groups as *mut Vec<*mut u8>;
+        let new_group_row_indices_ptr = &mut self.new_group_row_indices as *mut Vec<u32>;
 
         self.map.emplace_batch_full(
             hashes,
@@ -402,22 +552,103 @@ impl TaperColumnSerializeHandler {
                 let rc = unsafe { &mut *rc_ptr };
                 let row = rc.new_row();
                 unsafe {
-                    store_key_one_row_from_decode(rc, row, i, columns, &*col_descs, &*col_offsets, &*varchar_col_indices, varchar_slot_col_idx, use_merged);
-                    RowContainer::store_value::<i64>(row, agg_offset, agg_values[i]);
                     *groups_ptr.add(i) = row as *const u8;
+                    (*new_groups_ptr).push(row);
+                    (*new_group_row_indices_ptr).push(i as u32);
                 }
                 sv.set_ptr(row as *const u8);
             },
             &mut |i: usize, sv: &SlotValue, is_new: bool| {
-                if !is_new { unsafe { *groups_ptr.add(i) = sv.get_ptr(); (*update_indices_ptr).push(i as u32); } }
+                unsafe {
+                    *groups_ptr.add(i) = sv.get_ptr();
+                    if !is_new {
+                        (*update_indices_ptr).push(i as u32);
+                    }
+                }
             },
         );
 
-        // Step 4: GetUnequalsNumWithDecode — mirrors C++ method of same name
+        // Step 3: batch-store keys for new groups, then initialize aggregate state.
+        if !self.new_groups.is_empty() {
+            if self.use_merged && self.varchar_col_indices.len() > 1 {
+                batch_store_merged_varchar_columns(
+                    &mut self.rc,
+                    &self.new_groups,
+                    &self.new_group_row_indices,
+                    columns,
+                    &self.varchar_col_indices,
+                    self.varchar_slot_col_idx,
+                );
+            }
+
+            for (col_idx, desc) in self.col_descs.iter().enumerate() {
+                match desc {
+                    ColumnDesc::Varchar => {
+                        if self.use_merged && self.varchar_col_indices.len() > 1 {
+                            continue;
+                        }
+                        batch_store_key_column_varchar(
+                            &mut self.rc,
+                            col_idx,
+                            &self.new_groups,
+                            &self.new_group_row_indices,
+                            columns,
+                        );
+                    }
+                    ColumnDesc::Int64 => {
+                        batch_store_key_column_i64(
+                            &self.rc,
+                            col_idx,
+                            &self.new_groups,
+                            &self.new_group_row_indices,
+                            columns,
+                        );
+                    }
+                }
+            }
+
+            for (&row, &row_idx) in self.new_groups.iter().zip(self.new_group_row_indices.iter()) {
+                RowContainer::store_value::<i64>(row, self.agg_offset, agg_values[row_idx as usize]);
+            }
+        }
+
+        // Step 4
         let count = self.update_indices.len();
         if count == 0 { return; }
         let mut working_indices = std::mem::take(&mut self.update_indices);
-        let idx_from = self.get_unequals_num_with_decode(&mut working_indices, count, columns);
+        let num_varchar = self.varchar_col_indices.len();
+        if self.use_merged && num_varchar > 0 {
+            let max_idx = *working_indices[..count].iter().max().unwrap_or(&0) as usize;
+            let cache_size = (max_idx + 1) * num_varchar;
+            self.merged_cache.resize(cache_size, std::ptr::null());
+            unsafe { std::ptr::write_bytes(self.merged_cache.as_mut_ptr(), 0, cache_size); }
+            self.merged_out_ptrs.resize(num_varchar, std::ptr::null());
+            for wi in 0..count {
+                let idx = working_indices[wi] as usize;
+                get_all_merged_varchar_ptrs(self.groups[idx], self.varchar_slot_col_offset, &self.varchar_col_descs, &mut self.merged_out_ptrs);
+                for vc in 0..num_varchar { self.merged_cache[idx * num_varchar + vc] = self.merged_out_ptrs[vc]; }
+            }
+        }
+        let mut idx_from = 0usize;
+        for (col_idx, desc) in self.col_descs.iter().enumerate() {
+            if idx_from >= count { break; }
+            let remaining = count - idx_from;
+            match desc {
+                ColumnDesc::Int64 => {
+                    let input = match &columns[col_idx] { ColumnInput::Int64(v) => *v, _ => panic!("") };
+                    idx_from += batch_compare_decoded_i64(&mut working_indices[idx_from..], remaining, input, &self.groups, self.col_offsets[col_idx]);
+                }
+                ColumnDesc::Varchar => {
+                    let input = match &columns[col_idx] { ColumnInput::Varchar(v) => *v, _ => panic!("") };
+                    if self.use_merged && num_varchar > 1 {
+                        let vc_pos = self.varchar_col_indices.iter().position(|&c| c == col_idx).unwrap();
+                        idx_from += batch_compare_varchar_decoded_cached(&mut working_indices[idx_from..], remaining, input, &self.merged_cache, num_varchar, vc_pos);
+                    } else {
+                        idx_from += batch_compare_varchar_decoded(&mut working_indices[idx_from..], remaining, input, &self.groups, self.col_offsets[col_idx]);
+                    }
+                }
+            }
+        }
 
         // Step 5
         for ui in 0..idx_from {
@@ -427,10 +658,22 @@ impl TaperColumnSerializeHandler {
             let col_offsets_ref = &self.col_offsets;
             let varchar_col_indices_ref = &self.varchar_col_indices;
             let vc_slot_idx = self.varchar_slot_col_idx;
+            let vc_slot_offset = self.varchar_slot_col_offset;
             let merged = self.use_merged;
             let agg_off = self.agg_offset;
             let rc_ptr2 = &mut self.rc as *mut RowContainer;
-            let key_cmp = |sv: &SlotValue| -> bool { compare_keys_with_decode(sv.get_ptr(), row_idx, columns, col_descs_ref, col_offsets_ref) };
+            let key_cmp = |sv: &SlotValue| -> bool {
+                compare_keys_with_decode_layout(
+                    sv.get_ptr(),
+                    row_idx,
+                    columns,
+                    col_descs_ref,
+                    col_offsets_ref,
+                    varchar_col_indices_ref,
+                    vc_slot_offset,
+                    merged,
+                )
+            };
             let mut on_init = |sv: &mut SlotValue| {
                 let rc = unsafe { &mut *rc_ptr2 };
                 let row = rc.new_row();
@@ -452,67 +695,5 @@ impl TaperColumnSerializeHandler {
         }
         self.update_indices = working_indices;
     }
-
-    /// Mirrors C++ `TaperColumnSerializeHandler::GetUnequalsNumWithDecode`.
-    #[inline(never)]
-    fn get_unequals_num_with_decode(
-        &mut self, working_indices: &mut [u32], count: usize, columns: &[ColumnInput],
-    ) -> usize {
-        let num_varchar = self.varchar_col_indices.len();
-
-        // Build merged varchar cache
-        if self.use_merged && num_varchar > 0 {
-            let max_idx = *working_indices[..count].iter().max().unwrap_or(&0) as usize;
-            let cache_size = (max_idx + 1) * num_varchar;
-            self.merged_cache.resize(cache_size, std::ptr::null());
-            unsafe { std::ptr::write_bytes(self.merged_cache.as_mut_ptr(), 0, cache_size); }
-            let mut out_ptrs = vec![std::ptr::null::<u8>(); num_varchar];
-            for wi in 0..count {
-                let idx = working_indices[wi] as usize;
-                get_all_merged_varchar_ptrs(
-                    self.groups[idx], self.varchar_slot_col_offset,
-                    &self.varchar_col_descs, &mut out_ptrs,
-                );
-                for vc in 0..num_varchar {
-                    self.merged_cache[idx * num_varchar + vc] = out_ptrs[vc];
-                }
-            }
-        }
-
-        let mut idx_from = 0usize;
-        for (col_idx, desc) in self.col_descs.iter().enumerate() {
-            if idx_from >= count { break; }
-            let remaining = count - idx_from;
-            match desc {
-                ColumnDesc::Int64 => {
-                    let input = match &columns[col_idx] {
-                        ColumnInput::Int64(v) => *v, _ => panic!("")
-                    };
-                    idx_from += batch_compare_decoded_i64(
-                        &mut working_indices[idx_from..], remaining,
-                        input, &self.groups, self.col_offsets[col_idx],
-                    );
-                }
-                ColumnDesc::Varchar => {
-                    let input = match &columns[col_idx] {
-                        ColumnInput::Varchar(v) => *v, _ => panic!("")
-                    };
-                    if self.use_merged && num_varchar > 1 {
-                        let vc_pos = self.varchar_col_indices.iter()
-                            .position(|&c| c == col_idx).unwrap();
-                        idx_from += batch_compare_varchar_decoded_cached(
-                            &mut working_indices[idx_from..], remaining,
-                            input, &self.merged_cache, num_varchar, vc_pos,
-                        );
-                    } else {
-                        idx_from += batch_compare_varchar_decoded(
-                            &mut working_indices[idx_from..], remaining,
-                            input, &self.groups, self.col_offsets[col_idx],
-                        );
-                    }
-                }
-            }
-        }
-        idx_from
-    }
 }
+
