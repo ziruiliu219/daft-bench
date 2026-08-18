@@ -173,28 +173,43 @@ fn generate_mixed_data(
 // ═══════════════════════════════════════════════════════════════════
 
 #[inline(never)]
-fn run_taper_mixed(data: &MixedBenchData, ht_size: usize) {
+fn run_taper_mixed(data: &MixedBenchData, num_chunks: usize) {
+    const BATCH_SIZE: usize = 4096;
+
     // Build schema
     let mut col_descs: Vec<ColumnDesc> = Vec::new();
     for _ in 0..data.num_str_cols { col_descs.push(ColumnDesc::Varchar); }
     for _ in 0..data.num_int_cols { col_descs.push(ColumnDesc::Int64); }
 
-    let mut table = TaperColumnSerializeHandler::new(&col_descs, 8, ht_size);
+    let mut table = TaperColumnSerializeHandler::new(&col_descs, 8, num_chunks);
 
-    // Build column inputs
-    let str_slices: Vec<Vec<&[u8]>> = (0..data.num_str_cols)
-        .map(|c| data.str_cols[c].iter().map(|s| s.as_slice()).collect())
-        .collect();
+    let total_rows = data.hashes.len();
+    let num_batches = (total_rows + BATCH_SIZE - 1) / BATCH_SIZE;
 
-    let mut columns: Vec<ColumnInput> = Vec::new();
-    for c in 0..data.num_str_cols {
-        columns.push(ColumnInput::Varchar(&str_slices[c]));
+    for batch_idx in 0..num_batches {
+        let start = batch_idx * BATCH_SIZE;
+        let end = (start + BATCH_SIZE).min(total_rows);
+        let batch_len = end - start;
+
+        // Slice this batch's data
+        let batch_hashes = &data.hashes[start..end];
+        let batch_values = &data.values[start..end];
+
+        let str_slices: Vec<Vec<&[u8]>> = (0..data.num_str_cols)
+            .map(|c| data.str_cols[c][start..end].iter().map(|s| s.as_slice()).collect())
+            .collect();
+
+        let mut columns: Vec<ColumnInput> = Vec::new();
+        for c in 0..data.num_str_cols {
+            columns.push(ColumnInput::Varchar(&str_slices[c]));
+        }
+        for c in 0..data.num_int_cols {
+            columns.push(ColumnInput::Int64(&data.int_cols[c][start..end]));
+        }
+
+        table.emplace_table_with_decode(batch_hashes, &columns, batch_values);
     }
-    for c in 0..data.num_int_cols {
-        columns.push(ColumnInput::Int64(&data.int_cols[c]));
-    }
 
-    table.emplace_table_with_decode(&data.hashes, &columns, &data.values);
     black_box(table.num_groups());
 }
 
