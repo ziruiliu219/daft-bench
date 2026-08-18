@@ -45,13 +45,76 @@ pub enum ColumnKind {
 /// Size of pointer slot for varchar columns in row.
 const VARCHAR_SLOT_SIZE: usize = std::mem::size_of::<*const u8>();
 
-/// Block size for varchar arena.
-const VARCHAR_ARENA_BLOCK_SIZE: usize = 64 * 1024;
+struct SimpleArenaAllocator {
+    chunks: Vec<(*mut u8, usize)>,
+    chunk_sizes: Vec<usize>,
+    avail_buf: *mut u8,
+    avail_bytes: usize,
+    min_chunk_size: usize,
+    growth_factor: usize,
+    linear_growth_threshold: usize,
+}
 
-/// RowContainer: stores group rows in fixed-size blocks.
+impl SimpleArenaAllocator {
+    fn new() -> Self {
+        Self {
+            chunks: Vec::new(),
+            chunk_sizes: Vec::new(),
+            avail_buf: std::ptr::null_mut(),
+            avail_bytes: 0,
+            min_chunk_size: 4096,
+            growth_factor: 2,
+            linear_growth_threshold: 512 * 1024,
+        }
+    }
+
+    fn allocate(&mut self, size: usize) -> *mut u8 {
+        if size == 0 {
+            return std::ptr::NonNull::<u8>::dangling().as_ptr();
+        }
+        if self.avail_bytes < size {
+            self.allocate_chunk(self.next_chunk_size(size));
+        }
+        let ret = self.avail_buf;
+        self.avail_buf = unsafe { self.avail_buf.add(size) };
+        self.avail_bytes -= size;
+        ret
+    }
+
+    fn next_chunk_size(&self, size: usize) -> usize {
+        match self.chunk_sizes.last().copied() {
+            None => size.max(self.min_chunk_size),
+            Some(last) if last < self.linear_growth_threshold => size.max(last * self.growth_factor),
+            Some(_) => {
+                let threshold = self.linear_growth_threshold;
+                ((size + threshold - 1) / threshold) * threshold
+            }
+        }
+    }
+
+    fn allocate_chunk(&mut self, size: usize) {
+        let ptr = unsafe { libc::malloc(size) as *mut u8 };
+        assert!(!ptr.is_null(), "malloc failed");
+        self.chunks.push((ptr, size));
+        self.chunk_sizes.push(size);
+        self.avail_buf = ptr;
+        self.avail_bytes = size;
+    }
+}
+
+impl Drop for SimpleArenaAllocator {
+    fn drop(&mut self) {
+        for &(ptr, _) in &self.chunks {
+            unsafe { libc::free(ptr as *mut libc::c_void); }
+        }
+    }
+}
+
+/// RowContainer: stores group rows in fixed-size arena allocations.
 /// Mirrors C++ `RowContainer`.
 pub struct RowContainer {
-    blocks: Vec<Vec<u8>>,
+    pool: SimpleArenaAllocator,
+    row_blocks: Vec<(*mut u8, usize)>,
     row_size: usize,
     columns: Vec<RowColumn>,
     column_kinds: Vec<ColumnKind>,
@@ -62,12 +125,8 @@ pub struct RowContainer {
     agg_state_offset: usize,
     num_keys: usize,
     num_rows: usize,
-    current_block_idx: usize,
-    current_row_in_block: usize,
-    // Varchar arena (exposed to TaperColumnSerializeHandler via arena_alloc)
-    varchar_arena_blocks: Vec<Vec<u8>>,
-    varchar_arena_current_block: usize,
-    varchar_arena_offset: usize,
+    batch_ptr: *mut u8,
+    batch_remaining: usize,
 }
 
 impl RowContainer {
@@ -101,39 +160,39 @@ impl RowContainer {
             .map(|i| RowColumn::pack(offsets[i], i, null_block_start))
             .collect();
 
-        let first_block = vec![0u8; row_size * BLOCK_ROWS];
-        let has_varchar = kinds.iter().any(|k| *k == ColumnKind::Varchar);
-        let varchar_arena_blocks = if has_varchar { vec![vec![0u8; VARCHAR_ARENA_BLOCK_SIZE]] } else { Vec::new() };
-
         RowContainer {
-            blocks: vec![first_block], row_size, columns, column_kinds: kinds.to_vec(),
+            pool: SimpleArenaAllocator::new(),
+            row_blocks: Vec::new(),
+            row_size,
+            columns,
+            column_kinds: kinds.to_vec(),
             null_block_start, null_bytes, agg_state_offset, num_keys, num_rows: 0,
-            current_block_idx: 0, current_row_in_block: 0,
-            varchar_arena_blocks, varchar_arena_current_block: 0, varchar_arena_offset: 0,
+            batch_ptr: std::ptr::null_mut(),
+            batch_remaining: 0,
         }
     }
 
     /// Mirrors C++ `RowContainer::NewRow()`.
     pub fn new_row(&mut self) -> *mut u8 {
-        if self.current_row_in_block >= BLOCK_ROWS {
-            let new_block = vec![0u8; self.row_size * BLOCK_ROWS];
-            self.blocks.push(new_block);
-            self.current_block_idx = self.blocks.len() - 1;
-            self.current_row_in_block = 0;
+        if self.batch_remaining == 0 {
+            let bytes = self.row_size * BLOCK_ROWS;
+            self.batch_ptr = self.pool.allocate(bytes);
+            unsafe { std::ptr::write_bytes(self.batch_ptr, 0, bytes); }
+            self.row_blocks.push((self.batch_ptr, BLOCK_ROWS));
+            self.batch_remaining = BLOCK_ROWS;
         }
-        let offset_in_block = self.current_row_in_block * self.row_size;
-        self.current_row_in_block += 1;
+        let row_idx_in_block = BLOCK_ROWS - self.batch_remaining;
+        let row = unsafe { self.batch_ptr.add(row_idx_in_block * self.row_size) };
+        self.batch_remaining -= 1;
         self.num_rows += 1;
-        unsafe { self.blocks[self.current_block_idx].as_mut_ptr().add(offset_in_block) }
+        row
     }
 
     pub fn reserve(&mut self, additional: usize) {
-        let rows_in_current = BLOCK_ROWS - self.current_row_in_block;
-        if additional > rows_in_current {
-            let extra_needed = additional - rows_in_current;
-            let blocks_needed = (extra_needed + BLOCK_ROWS - 1) / BLOCK_ROWS;
-            self.blocks.reserve(blocks_needed);
-        }
+        let rows_in_current = self.batch_remaining;
+        let extra_needed = additional.saturating_sub(rows_in_current);
+        let blocks_needed = (extra_needed + BLOCK_ROWS - 1) / BLOCK_ROWS;
+        self.row_blocks.reserve(blocks_needed);
     }
 
     /// Mirrors C++ `RowContainer::IsNullAt`.
@@ -186,23 +245,31 @@ impl RowContainer {
 
     pub fn column_kind(&self, col_idx: usize) -> ColumnKind { self.column_kinds[col_idx] }
 
+    pub fn agg_i64_checksum(&self, agg_offset: usize) -> i64 {
+        let mut checksum = 0i64;
+        let mut remaining = self.num_rows;
+        for &(block, rows_allocated) in &self.row_blocks {
+            if remaining == 0 {
+                break;
+            }
+            let rows_in_block = remaining.min(rows_allocated);
+            for row_idx in 0..rows_in_block {
+                let offset = row_idx * self.row_size + agg_offset;
+                let value = unsafe { (block.add(offset) as *const i64).read_unaligned() };
+                checksum = checksum.wrapping_add(value);
+            }
+            remaining -= rows_in_block;
+        }
+        checksum
+    }
+
     // ─── Arena allocator (exposed for TaperColumnSerializeHandler) ───
 
     /// Allocate bytes from the varchar arena.
-    /// Mirrors C++ `arenaAllocator.AllocateContinue(size, ...)`.
+    /// Mirrors the C++ row/varchar arena allocation model: one bump allocator
+    /// backs both fixed rows and variable-width key payloads.
     pub fn arena_alloc(&mut self, size: usize) -> *mut u8 {
-        if self.varchar_arena_blocks.is_empty()
-            || self.varchar_arena_offset + size > VARCHAR_ARENA_BLOCK_SIZE
-        {
-            let block_size = size.max(VARCHAR_ARENA_BLOCK_SIZE);
-            self.varchar_arena_blocks.push(vec![0u8; block_size]);
-            self.varchar_arena_current_block = self.varchar_arena_blocks.len() - 1;
-            self.varchar_arena_offset = 0;
-        }
-        let block = &mut self.varchar_arena_blocks[self.varchar_arena_current_block];
-        let ptr = unsafe { block.as_mut_ptr().add(self.varchar_arena_offset) };
-        self.varchar_arena_offset += size;
-        ptr
+        self.pool.allocate(size)
     }
 }
 
@@ -275,3 +342,4 @@ mod tests {
         assert_eq!(rc.num_rows(), 5000);
     }
 }
+
