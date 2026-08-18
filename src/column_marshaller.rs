@@ -375,11 +375,9 @@ impl TaperColumnSerializeHandler {
         let n = hashes.len();
         if n == 0 { return; }
 
-        // Ensure hash table capacity >= numRows (matches OmniOperator pre-sizing)
-        while self.map.capacity() < n {
-            let new_chunks = (self.map.num_chunks() * 2).max(n / 8 + 1).next_power_of_two();
-            self.map = crate::taper_hashmap::TaperHashMap::with_capacity(new_chunks);
-        }
+        // No capacity check here — caller must pass sufficient initial_capacity
+        // to TaperColumnSerializeHandler::new() so that no rehash occurs.
+        // This matches rust-taper-hashmap2 behavior.
 
         // Reuse buffers (mirrors C++ class member resize pattern)
         self.groups.resize(n, std::ptr::null());

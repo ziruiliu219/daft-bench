@@ -315,8 +315,17 @@ fn bench_hashagg(c: &mut Criterion) {
                     let arrays = build_arrow_arrays(&data);
                     let param = format!("{}_ht={}_lf={:.2}_sel={:.1}", type_name, ht_size, load_factor, selectivity);
 
-                    group.bench_with_input(BenchmarkId::new("daft", &param), &data, |b, d| { b.iter(|| run_daft_mixed(black_box(d), ht_size, &arrays)); });
-                    group.bench_with_input(BenchmarkId::new("taper", &param), &data, |b, d| { b.iter(|| run_taper_mixed(black_box(d), ht_size)); });
+                    // Pre-allocate enough chunks so load stays below 0.9 threshold (no rehash).
+                    // distinct_keys = num_keys + num_misses
+                    let num_misses = num_probe_rows - (num_probe_rows as f64 * selectivity) as usize;
+                    let distinct_keys = num_keys + num_misses;
+                    let min_slots = ((distinct_keys as f64 / 0.85) as usize).max(8);
+                    let num_chunks = ((min_slots + 7) / 8).next_power_of_two();
+
+                    let daft_capacity = ((distinct_keys as f64 / 0.75) as usize).max(8);
+
+                    group.bench_with_input(BenchmarkId::new("daft", &param), &data, |b, d| { b.iter(|| run_daft_mixed(black_box(d), daft_capacity, &arrays)); });
+                    group.bench_with_input(BenchmarkId::new("taper", &param), &data, |b, d| { b.iter(|| run_taper_mixed(black_box(d), num_chunks)); });
                 }
             }
         }
