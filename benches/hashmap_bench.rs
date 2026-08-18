@@ -278,6 +278,8 @@ fn build_arrow_arrays(data: &MixedBenchData) -> Vec<ArrayRef> {
 
 #[inline(never)]
 fn run_daft_mixed(data: &MixedBenchData, ht_size: usize, arrays: &[ArrayRef]) {
+    const BATCH_SIZE: usize = 4096;
+
     let mut table = HashMap::<IndexHash, u32, IdentityBuildHasher>::with_capacity_and_hasher(ht_size, Default::default());
     let mut ngroups: u32 = 0;
     let mut sums = Vec::<i64>::with_capacity(ht_size);
@@ -285,16 +287,25 @@ fn run_daft_mixed(data: &MixedBenchData, ht_size: usize, arrays: &[ArrayRef]) {
     // Build comparator from Arrow arrays — same as Daft's build_multi_array_is_equal
     let comparator = build_multi_array_is_equal(arrays);
 
-    for (i, &h) in data.hashes.iter().enumerate() {
-        let entry: RawEntryMut<'_, IndexHash, u32, BuildHasherDefault<IdentityHasher>> = table.raw_entry_mut().from_hash(h, |other| {
-            if h != other.hash { return false; }
-            comparator(i, other.idx as usize)
-        });
-        match entry {
-            RawEntryMut::Occupied(e) => { sums[*e.get() as usize] += data.values[i]; }
-            RawEntryMut::Vacant(e) => {
-                e.insert_hashed_nocheck(h, IndexHash { idx: i as u64, hash: h }, ngroups);
-                ngroups += 1; sums.push(data.values[i]);
+    let total_rows = data.hashes.len();
+    let num_batches = (total_rows + BATCH_SIZE - 1) / BATCH_SIZE;
+
+    for batch_idx in 0..num_batches {
+        let start = batch_idx * BATCH_SIZE;
+        let end = (start + BATCH_SIZE).min(total_rows);
+
+        for i in start..end {
+            let h = data.hashes[i];
+            let entry: RawEntryMut<'_, IndexHash, u32, BuildHasherDefault<IdentityHasher>> = table.raw_entry_mut().from_hash(h, |other| {
+                if h != other.hash { return false; }
+                comparator(i, other.idx as usize)
+            });
+            match entry {
+                RawEntryMut::Occupied(e) => { sums[*e.get() as usize] += data.values[i]; }
+                RawEntryMut::Vacant(e) => {
+                    e.insert_hashed_nocheck(h, IndexHash { idx: i as u64, hash: h }, ngroups);
+                    ngroups += 1; sums.push(data.values[i]);
+                }
             }
         }
     }
