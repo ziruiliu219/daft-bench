@@ -313,29 +313,18 @@ fn run_hashbrown_persistent(data: &MixedBenchData, capacity: usize) {
         let end = (start + BATCH_SIZE).min(total_rows);
         let batch_len = end - start;
 
-        // Simulate receiving a batch: copy batch data into local owned memory
-        // (in real engines this is the batch arriving from upstream / disk / network)
-        let batch_str_cols: Vec<Vec<Vec<u8>>> = (0..data.num_str_cols)
-            .map(|c| data.str_cols[c][start..end].iter().map(|s| s.clone()).collect())
+        // Slice refs into the batch data (no copy — batch data is alive during processing)
+        let str_slices: Vec<Vec<&[u8]>> = (0..data.num_str_cols)
+            .map(|c| data.str_cols[c][start..end].iter().map(|s| s.as_slice()).collect())
             .collect();
-        let batch_int_cols: Vec<Vec<i64>> = (0..data.num_int_cols)
-            .map(|c| data.int_cols[c][start..end].to_vec())
-            .collect();
-        let batch_hashes: Vec<u64> = data.hashes[start..end].to_vec();
-        let batch_values: Vec<i64> = data.values[start..end].to_vec();
-
-        // Build slice refs from the local batch copy
-        let str_slices: Vec<Vec<&[u8]>> = batch_str_cols.iter()
-            .map(|col| col.iter().map(|s| s.as_slice()).collect())
-            .collect();
-        let int_slices: Vec<&[i64]> = batch_int_cols.iter()
-            .map(|col| col.as_slice())
+        let int_slices: Vec<&[i64]> = (0..data.num_int_cols)
+            .map(|c| &data.int_cols[c][start..end])
             .collect();
         let str_refs: Vec<&[&[u8]]> = str_slices.iter().map(|v| v.as_slice()).collect();
         let int_refs: Vec<&[i64]> = int_slices.iter().map(|s| *s).collect();
 
         for row in 0..batch_len {
-            let h = batch_hashes[row];
+            let h = data.hashes[start + row];
             let entry = table.raw_entry_mut().from_hash(h, |other| {
                 if h != other.hash { return false; }
                 // Compare current batch row against arena-stored keys
@@ -343,18 +332,16 @@ fn run_hashbrown_persistent(data: &MixedBenchData, capacity: usize) {
             });
             match entry {
                 RawEntryMut::Occupied(e) => {
-                    sums[*e.get() as usize] += batch_values[row];
+                    sums[*e.get() as usize] += data.values[start + row];
                 }
                 RawEntryMut::Vacant(e) => {
-                    // Copy key into persistent arena (batch will be released below)
+                    // Only copy: new key into persistent arena
                     let gid = store.push_keys(&str_refs, &int_refs, row);
                     e.insert_hashed_nocheck(h, IndexHash { idx: gid as u64, hash: h }, gid);
-                    sums.push(batch_values[row]);
+                    sums.push(data.values[start + row]);
                 }
             }
         }
-        // ← batch_str_cols, batch_int_cols, batch_hashes, batch_values all drop here
-        //   simulating batch memory release
     }
     black_box(sums.len());
 }
