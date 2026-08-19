@@ -1,8 +1,7 @@
-//! Hash table benchmark: TaperHashMap vs Daft-style hashbrown (staged aggregation)
+//! Hash table benchmark: TaperHashMap vs Daft-style hashbrown
 //!
-//! Data generation: generate_mixed_data (build + probe with selectivity)
-//! Taper: persistent hash table, multi-batch (410 rows/batch)
-//! Daft: staged aggregation (per-batch local agg → final merge)
+//! Single-batch mode: all rows processed in ONE batch (no multi-batch, no staged agg)
+//! HT pre-allocated large enough to guarantee NO rehash/expand during the run.
 
 use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
 use hashbrown::{HashMap, hash_map::RawEntryMut};
@@ -36,7 +35,7 @@ fn gen_string(prefix: &str, i: usize, c: usize) -> Vec<u8> {
 }
 
 // ═══════════════════════════════════════════════════════════════════
-// Data generation (your original structure)
+// Data generation
 
 struct MixedBenchData {
     str_cols: Vec<Vec<Vec<u8>>>,
@@ -103,7 +102,7 @@ fn generate_mixed_data(
     let probe_hashes: Vec<u64> = order.iter().map(|&i| probe_hashes[i]).collect();
     let probe_values: Vec<i64> = (0..num_probe_rows).map(|i| (i % 1000) as i64).collect();
 
-    // Combine
+    // Combine build + probe into one array
     for c in 0..num_str_cols { build_str_cols[c].extend(probe_str_cols[c].clone()); }
     let mut all_int_cols = build_int_cols;
     for c in 0..num_int_cols { all_int_cols[c].extend_from_slice(&probe_int_cols[c]); }
@@ -118,9 +117,7 @@ fn generate_mixed_data(
 }
 
 // ═══════════════════════════════════════════════════════════════════
-// Taper runner (persistent hash table, multi-batch)
-
-const BATCH_SIZE: usize = 410;
+// Taper runner: single batch, all rows at once
 
 #[inline(never)]
 fn run_taper_mixed(data: &MixedBenchData, num_chunks: usize) {
@@ -129,118 +126,54 @@ fn run_taper_mixed(data: &MixedBenchData, num_chunks: usize) {
     for _ in 0..data.num_int_cols { col_descs.push(ColumnDesc::Int64); }
 
     let mut table = TaperColumnSerializeHandler::new(&col_descs, 8, num_chunks);
-    let total_rows = data.hashes.len();
-    let num_batches = (total_rows + BATCH_SIZE - 1) / BATCH_SIZE;
 
-    for batch_idx in 0..num_batches {
-        let start = batch_idx * BATCH_SIZE;
-        let end = (start + BATCH_SIZE).min(total_rows);
+    // Build column inputs for ALL rows at once
+    let str_slices: Vec<Vec<&[u8]>> = (0..data.num_str_cols)
+        .map(|c| data.str_cols[c].iter().map(|s| s.as_slice()).collect())
+        .collect();
 
-        let batch_hashes = &data.hashes[start..end];
-        let batch_values = &data.values[start..end];
-        let str_slices: Vec<Vec<&[u8]>> = (0..data.num_str_cols)
-            .map(|c| data.str_cols[c][start..end].iter().map(|s| s.as_slice()).collect())
-            .collect();
+    let mut columns: Vec<ColumnInput> = Vec::new();
+    for c in 0..data.num_str_cols { columns.push(ColumnInput::Varchar(&str_slices[c])); }
+    for c in 0..data.num_int_cols { columns.push(ColumnInput::Int64(&data.int_cols[c])); }
 
-        let mut columns: Vec<ColumnInput> = Vec::new();
-        for c in 0..data.num_str_cols { columns.push(ColumnInput::Varchar(&str_slices[c])); }
-        for c in 0..data.num_int_cols { columns.push(ColumnInput::Int64(&data.int_cols[c][start..end])); }
-
-        table.emplace_table_with_decode(batch_hashes, &columns, batch_values);
-    }
+    // Single batch: process all rows in one call
+    table.emplace_table_with_decode(&data.hashes, &columns, &data.values);
     black_box(table.num_groups());
 }
 
 // ═══════════════════════════════════════════════════════════════════
-// Daft runner: staged aggregation (per-batch local agg → final merge)
-//
-// Mirrors real Daft: each batch is aggregated locally with hashbrown,
-// then partial results are merged at the end.
+// Daft runner: single batch, all rows at once (pre-allocated, no rehash)
 
 #[inline(never)]
-fn run_daft_staged(data: &MixedBenchData, capacity: usize) {
-    let total_rows = data.hashes.len();
-    let num_batches = (total_rows + BATCH_SIZE - 1) / BATCH_SIZE;
-
-    // Accumulate partial results from each batch
-    // Each partial: Vec of (representative row index in global data, partial sum)
-    let mut all_partial_indices: Vec<usize> = Vec::new();
-    let mut all_partial_sums: Vec<i64> = Vec::new();
-    let mut all_partial_hashes: Vec<u64> = Vec::new();
-
-    for batch_idx in 0..num_batches {
-        let start = batch_idx * BATCH_SIZE;
-        let end = (start + BATCH_SIZE).min(total_rows);
-
-        // Per-batch local aggregation
-        let mut table = HashMap::<IndexHash, u32, IdentityBuildHasher>::with_capacity_and_hasher(
-            (end - start).min(capacity), Default::default(),
-        );
-        let mut reps: Vec<usize> = Vec::new();
-        let mut sums: Vec<i64> = Vec::new();
-
-        for i in start..end {
-            let h = data.hashes[i];
-            let entry = table.raw_entry_mut().from_hash(h, |other| {
-                if h != other.hash { return false; }
-                let oi = other.idx as usize;
-                // Compare all columns
-                for c in 0..data.num_str_cols {
-                    if data.str_cols[c][i] != data.str_cols[c][oi] { return false; }
-                }
-                for c in 0..data.num_int_cols {
-                    if data.int_cols[c][i] != data.int_cols[c][oi] { return false; }
-                }
-                true
-            });
-            match entry {
-                RawEntryMut::Occupied(e) => { sums[*e.get() as usize] += data.values[i]; }
-                RawEntryMut::Vacant(e) => {
-                    let gid = reps.len() as u32;
-                    e.insert_hashed_nocheck(h, IndexHash { idx: i as u64, hash: h }, gid);
-                    reps.push(i);
-                    sums.push(data.values[i]);
-                }
-            }
-        }
-
-        // Collect partial results
-        for (gid, &rep_idx) in reps.iter().enumerate() {
-            all_partial_indices.push(rep_idx);
-            all_partial_sums.push(sums[gid]);
-            all_partial_hashes.push(data.hashes[rep_idx]);
-        }
-    }
-
-    // Final merge: aggregate all partial results
-    let mut final_table = HashMap::<IndexHash, u32, IdentityBuildHasher>::with_capacity_and_hasher(
+fn run_daft_mixed(data: &MixedBenchData, capacity: usize) {
+    let mut table = HashMap::<IndexHash, u32, IdentityBuildHasher>::with_capacity_and_hasher(
         capacity, Default::default(),
     );
-    let mut final_sums: Vec<i64> = Vec::new();
+    let mut ngroups: u32 = 0;
+    let mut sums = Vec::<i64>::with_capacity(capacity);
 
-    for (pi, &rep_idx) in all_partial_indices.iter().enumerate() {
-        let h = all_partial_hashes[pi];
-        let entry = final_table.raw_entry_mut().from_hash(h, |other| {
+    for (i, &h) in data.hashes.iter().enumerate() {
+        let entry = table.raw_entry_mut().from_hash(h, |other| {
             if h != other.hash { return false; }
             let oi = other.idx as usize;
             for c in 0..data.num_str_cols {
-                if data.str_cols[c][rep_idx] != data.str_cols[c][oi] { return false; }
+                if data.str_cols[c][i] != data.str_cols[c][oi] { return false; }
             }
             for c in 0..data.num_int_cols {
-                if data.int_cols[c][rep_idx] != data.int_cols[c][oi] { return false; }
+                if data.int_cols[c][i] != data.int_cols[c][oi] { return false; }
             }
             true
         });
         match entry {
-            RawEntryMut::Occupied(e) => { final_sums[*e.get() as usize] += all_partial_sums[pi]; }
+            RawEntryMut::Occupied(e) => { sums[*e.get() as usize] += data.values[i]; }
             RawEntryMut::Vacant(e) => {
-                let gid = final_sums.len() as u32;
-                e.insert_hashed_nocheck(h, IndexHash { idx: rep_idx as u64, hash: h }, gid);
-                final_sums.push(all_partial_sums[pi]);
+                e.insert_hashed_nocheck(h, IndexHash { idx: i as u64, hash: h }, ngroups);
+                ngroups += 1;
+                sums.push(data.values[i]);
             }
         }
     }
-    black_box(final_sums.len());
+    black_box(&sums);
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -268,18 +201,23 @@ fn bench_hashagg(c: &mut Criterion) {
                     let data = generate_mixed_data(num_str, num_int, num_keys, num_probe_rows, selectivity, &mut rng);
                     let param = format!("{}_ht={}_lf={:.2}_sel={:.1}", type_name, ht_size, load_factor, selectivity);
 
-                    // Pre-allocate to avoid rehash
+                    // Compute distinct keys to pre-allocate (no rehash)
                     let num_misses = num_probe_rows - (num_probe_rows as f64 * selectivity) as usize;
                     let distinct_keys = num_keys + num_misses;
+
+                    // Taper: allocate enough chunks so load < 0.9 (LOAD_FACTOR_THRESHOLD)
+                    // Each chunk has 8 slots. We want: distinct_keys / (num_chunks * 8) < 0.9
                     let min_slots = ((distinct_keys as f64 / 0.85) as usize).max(8);
                     let num_chunks = ((min_slots + 7) / 8).next_power_of_two();
-                    let daft_capacity = ((distinct_keys as f64 / 0.75) as usize).max(8);
+
+                    // Daft (hashbrown): default load factor ~0.875, give extra room
+                    let daft_capacity = ((distinct_keys as f64 / 0.7) as usize).max(8);
 
                     group.bench_with_input(BenchmarkId::new("taper", &param), &data, |b, d| {
                         b.iter(|| run_taper_mixed(black_box(d), num_chunks));
                     });
-                    group.bench_with_input(BenchmarkId::new("daft_staged", &param), &data, |b, d| {
-                        b.iter(|| run_daft_staged(black_box(d), daft_capacity));
+                    group.bench_with_input(BenchmarkId::new("daft", &param), &data, |b, d| {
+                        b.iter(|| run_daft_mixed(black_box(d), daft_capacity));
                     });
                 }
             }
