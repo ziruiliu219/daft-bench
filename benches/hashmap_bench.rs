@@ -1,7 +1,8 @@
 //! Hash table benchmark: TaperHashMap vs Daft-style hashbrown
 //!
-//! Single-batch mode: all rows processed in ONE batch (no multi-batch, no staged agg)
-//! HT pre-allocated large enough to guarantee NO rehash/expand during the run.
+//! Single-batch mode: all rows processed in ONE batch.
+//! Daft still goes through the full staged pipeline (agg → take → concat → final merge)
+//! because that's how Daft's code path works regardless of batch count.
 
 use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
 use hashbrown::{HashMap, hash_map::RawEntryMut};
@@ -136,38 +137,154 @@ fn run_taper_mixed(data: &MixedBenchData, num_chunks: usize) {
 }
 
 // ═══════════════════════════════════════════════════════════════════
-// Daft runner: single batch, all rows at once (no staged, no copy key)
+// Daft runner: single batch but full staged pipeline
+//
+// Even with one batch, Daft goes through:
+//   Phase 1: hashmap agg (comparator references batch data directly)
+//   Phase 2: accumulate (scatter values into group slots)
+//   Phase 3: take (copy keys into Arrow arrays — batch will be released)
+//   Phase 4: concat (trivial with one batch — just the partial itself)
+//   Phase 5: final merge (hashmap agg on concat'd data)
+
+/// Arrow-style Utf8 column
+struct Utf8Column {
+    offsets: Vec<i64>,
+    data: Vec<u8>,
+}
+impl Utf8Column {
+    fn with_capacity(num_rows: usize, avg_bytes: usize) -> Self {
+        let mut offsets = Vec::with_capacity(num_rows + 1);
+        offsets.push(0);
+        Self { offsets, data: Vec::with_capacity(num_rows * avg_bytes) }
+    }
+    fn len(&self) -> usize { self.offsets.len() - 1 }
+    fn push(&mut self, val: &[u8]) {
+        self.data.extend_from_slice(val);
+        self.offsets.push(self.data.len() as i64);
+    }
+    #[inline(always)]
+    fn get(&self, idx: usize) -> &[u8] {
+        let start = self.offsets[idx] as usize;
+        let end = self.offsets[idx + 1] as usize;
+        &self.data[start..end]
+    }
+}
+
+/// Arrow-style Int64 column
+struct Int64Column {
+    values: Vec<i64>,
+}
+impl Int64Column {
+    fn with_capacity(n: usize) -> Self { Self { values: Vec::with_capacity(n) } }
+    #[inline(always)]
+    fn get(&self, idx: usize) -> i64 { self.values[idx] }
+}
 
 #[inline(never)]
-fn run_daft_mixed(data: &MixedBenchData, capacity: usize) {
+fn run_daft_staged(data: &MixedBenchData, capacity: usize) {
+    let total_rows = data.hashes.len();
+
+    // ═══ Phase 1: hashmap agg (one batch = all rows) ═══
     let mut table = HashMap::<IndexHash, u32, IdentityBuildHasher>::with_capacity_and_hasher(
         capacity, Default::default(),
     );
+    let mut groupkey_indices: Vec<u64> = Vec::new();
+    let mut group_ids: Vec<u32> = Vec::with_capacity(total_rows);
     let mut num_groups: u32 = 0;
-    let mut sums: Vec<i64> = Vec::with_capacity(capacity);
 
-    for (i, &h) in data.hashes.iter().enumerate() {
+    for i in 0..total_rows {
+        let h = data.hashes[i];
         let entry = table.raw_entry_mut().from_hash(h, |other| {
             if h != other.hash { return false; }
-            let oi = other.idx as usize;
+            let j = other.idx as usize;
             for c in 0..data.num_str_cols {
-                if data.str_cols[c][i] != data.str_cols[c][oi] { return false; }
+                if data.str_cols[c][i] != data.str_cols[c][j] { return false; }
             }
             for c in 0..data.num_int_cols {
-                if data.int_cols[c][i] != data.int_cols[c][oi] { return false; }
+                if data.int_cols[c][i] != data.int_cols[c][j] { return false; }
             }
             true
         });
-        match entry {
-            RawEntryMut::Occupied(e) => { sums[*e.get() as usize] += data.values[i]; }
+        let gid = match entry {
             RawEntryMut::Vacant(e) => {
-                e.insert_hashed_nocheck(h, IndexHash { idx: i as u64, hash: h }, num_groups);
+                let gid = num_groups;
                 num_groups += 1;
-                sums.push(data.values[i]);
+                e.insert_hashed_nocheck(h, IndexHash { idx: i as u64, hash: h }, gid);
+                groupkey_indices.push(i as u64);
+                gid
             }
-        }
+            RawEntryMut::Occupied(e) => *e.get(),
+        };
+        group_ids.push(gid);
     }
-    black_box(sums.len());
+
+    // ═══ Phase 2: accumulate ═══
+    let mut sums: Vec<i64> = vec![0i64; num_groups as usize];
+    for (row, &gid) in group_ids.iter().enumerate() {
+        sums[gid as usize] += data.values[row];
+    }
+
+    // ═══ Phase 3: take (copy keys into Arrow arrays — batch released after this) ═══
+    let partial_str_cols: Vec<Utf8Column> = (0..data.num_str_cols).map(|c| {
+        let mut col = Utf8Column::with_capacity(num_groups as usize, 16);
+        for &idx in &groupkey_indices {
+            col.push(&data.str_cols[c][idx as usize]);
+        }
+        col
+    }).collect();
+    let partial_int_cols: Vec<Int64Column> = (0..data.num_int_cols).map(|c| {
+        let mut col = Int64Column::with_capacity(num_groups as usize);
+        for &idx in &groupkey_indices {
+            col.values.push(data.int_cols[c][idx as usize]);
+        }
+        col
+    }).collect();
+    let partial_hashes: Vec<u64> = groupkey_indices.iter()
+        .map(|&idx| data.hashes[idx as usize]).collect();
+
+    // ═══ Phase 4: concat (trivial — only one partial result) ═══
+    // concat_str_cols = partial_str_cols, concat_int_cols = partial_int_cols
+    // concat_hashes = partial_hashes, concat_sums = sums
+    let concat_len = num_groups as usize;
+
+    // ═══ Phase 5: final merge ═══
+    let mut final_table = HashMap::<IndexHash, u32, IdentityBuildHasher>::with_capacity_and_hasher(
+        capacity, Default::default(),
+    );
+    let mut final_num_groups: u32 = 0;
+    let mut final_group_ids: Vec<u32> = Vec::with_capacity(concat_len);
+
+    for i in 0..concat_len {
+        let h = partial_hashes[i];
+        let entry = final_table.raw_entry_mut().from_hash(h, |other| {
+            if h != other.hash { return false; }
+            let j = other.idx as usize;
+            for c in 0..data.num_str_cols {
+                if partial_str_cols[c].get(i) != partial_str_cols[c].get(j) { return false; }
+            }
+            for c in 0..data.num_int_cols {
+                if partial_int_cols[c].get(i) != partial_int_cols[c].get(j) { return false; }
+            }
+            true
+        });
+        let gid = match entry {
+            RawEntryMut::Vacant(e) => {
+                let gid = final_num_groups;
+                final_num_groups += 1;
+                e.insert_hashed_nocheck(h, IndexHash { idx: i as u64, hash: h }, gid);
+                gid
+            }
+            RawEntryMut::Occupied(e) => *e.get(),
+        };
+        final_group_ids.push(gid);
+    }
+
+    // Final accumulate
+    let mut final_sums: Vec<i64> = vec![0i64; final_num_groups as usize];
+    for (row, &gid) in final_group_ids.iter().enumerate() {
+        final_sums[gid as usize] += sums[row];
+    }
+    black_box(final_sums.len());
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -199,13 +316,13 @@ fn bench_hashagg(c: &mut Criterion) {
                     let distinct_keys = num_keys + num_misses;
                     let min_slots = ((distinct_keys as f64 / 0.85) as usize).max(8);
                     let num_chunks = ((min_slots + 7) / 8).next_power_of_two();
-                    let daft_capacity = ((distinct_keys as f64 / 0.7) as usize).max(8);
+                    let daft_capacity = ((distinct_keys as f64 / 0.75) as usize).max(8);
 
                     group.bench_with_input(BenchmarkId::new("taper", &param), &data, |b, d| {
                         b.iter(|| run_taper_mixed(black_box(d), num_chunks));
                     });
-                    group.bench_with_input(BenchmarkId::new("daft", &param), &data, |b, d| {
-                        b.iter(|| run_daft_mixed(black_box(d), daft_capacity));
+                    group.bench_with_input(BenchmarkId::new("daft_staged", &param), &data, |b, d| {
+                        b.iter(|| run_daft_staged(black_box(d), daft_capacity));
                     });
                 }
             }
