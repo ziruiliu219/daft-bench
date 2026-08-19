@@ -154,92 +154,265 @@ fn run_taper_mixed(data: &MixedBenchData, num_chunks: usize) {
 // ═══════════════════════════════════════════════════════════════════
 // Daft runner: staged aggregation (per-batch local agg → final merge)
 //
-// Mirrors real Daft: each batch is aggregated locally with hashbrown,
-// then partial results are merged at the end.
+// Mirrors Daft's actual data structures:
+// - Arrow-style columnar storage (offsets + data buffer for strings, Vec<i64> for ints)
+// - RecordBatch = Vec of columns
+// - comparator(i, j) compares two rows within the same columnar batch
+// - take(indices) copies key data into new Arrow arrays (partial result)
+// - concat merges all partial results into one big columnar batch
+// - final agg uses same HashMap+comparator pattern on the concat'd batch
+
+/// Arrow-style Utf8 column: offsets + contiguous data buffer.
+/// Mirrors Arrow's Utf8Array<i64>.
+struct Utf8Column {
+    offsets: Vec<i64>,   // length = num_rows + 1
+    data: Vec<u8>,       // all string bytes concatenated
+}
+
+impl Utf8Column {
+    fn new() -> Self {
+        Self { offsets: vec![0], data: Vec::new() }
+    }
+
+    fn with_capacity(num_rows: usize, avg_bytes: usize) -> Self {
+        let mut offsets = Vec::with_capacity(num_rows + 1);
+        offsets.push(0);
+        Self { offsets, data: Vec::with_capacity(num_rows * avg_bytes) }
+    }
+
+    fn len(&self) -> usize { self.offsets.len() - 1 }
+
+    /// Append a string value.
+    fn push(&mut self, val: &[u8]) {
+        self.data.extend_from_slice(val);
+        self.offsets.push(self.data.len() as i64);
+    }
+
+    /// Get string at row index.
+    #[inline(always)]
+    fn get(&self, idx: usize) -> &[u8] {
+        let start = self.offsets[idx] as usize;
+        let end = self.offsets[idx + 1] as usize;
+        &self.data[start..end]
+    }
+
+    /// take(indices) → new Utf8Column with copied data. Mirrors arrow::compute::take.
+    fn take(&self, indices: &[u64]) -> Self {
+        let mut result = Self::with_capacity(indices.len(), 16);
+        for &idx in indices {
+            result.push(self.get(idx as usize));
+        }
+        result
+    }
+
+    /// Concat multiple Utf8Columns into one. Mirrors Arrow concat.
+    fn concat(columns: &[&Self]) -> Self {
+        let total_rows: usize = columns.iter().map(|c| c.len()).sum();
+        let total_bytes: usize = columns.iter().map(|c| c.data.len()).sum();
+        let mut result = Self {
+            offsets: Vec::with_capacity(total_rows + 1),
+            data: Vec::with_capacity(total_bytes),
+        };
+        result.offsets.push(0);
+        for col in columns {
+            for i in 0..col.len() {
+                result.push(col.get(i));
+            }
+        }
+        result
+    }
+}
+
+/// Arrow-style Int64 column (just a Vec<i64>). Mirrors Arrow's PrimitiveArray<Int64>.
+struct Int64Column {
+    values: Vec<i64>,
+}
+
+impl Int64Column {
+    fn new() -> Self { Self { values: Vec::new() } }
+    fn with_capacity(n: usize) -> Self { Self { values: Vec::with_capacity(n) } }
+    fn len(&self) -> usize { self.values.len() }
+    fn push(&mut self, val: i64) { self.values.push(val); }
+
+    #[inline(always)]
+    fn get(&self, idx: usize) -> i64 { self.values[idx] }
+
+    fn take(&self, indices: &[u64]) -> Self {
+        let mut result = Self::with_capacity(indices.len());
+        for &idx in indices {
+            result.values.push(self.values[idx as usize]);
+        }
+        result
+    }
+
+    fn concat(columns: &[&Self]) -> Self {
+        let total: usize = columns.iter().map(|c| c.len()).sum();
+        let mut result = Self::with_capacity(total);
+        for col in columns {
+            result.values.extend_from_slice(&col.values);
+        }
+        result
+    }
+}
+
+/// A partial result from one batch. Mirrors Daft's MicroPartition/RecordBatch
+/// that gets pushed into state.partially_aggregated.
+/// Contains: group key columns (Arrow-style) + aggregated sum column.
+struct PartialResult {
+    str_key_cols: Vec<Utf8Column>,    // group key string columns
+    int_key_cols: Vec<Int64Column>,   // group key int columns
+    hashes: Vec<u64>,                 // hash of each group key
+    sums: Vec<i64>,                   // partial sum for each group
+}
 
 #[inline(never)]
 fn run_daft_staged(data: &MixedBenchData, capacity: usize) {
     let total_rows = data.hashes.len();
     let num_batches = (total_rows + BATCH_SIZE - 1) / BATCH_SIZE;
 
-    // Accumulate partial results from each batch
-    // Each partial: Vec of (representative row index in global data, partial sum)
-    let mut all_partial_indices: Vec<usize> = Vec::new();
-    let mut all_partial_sums: Vec<i64> = Vec::new();
-    let mut all_partial_hashes: Vec<u64> = Vec::new();
+    // state.partially_aggregated: Vec<MicroPartition> in Daft
+    let mut partial_results: Vec<PartialResult> = Vec::with_capacity(num_batches);
 
     for batch_idx in 0..num_batches {
         let start = batch_idx * BATCH_SIZE;
         let end = (start + BATCH_SIZE).min(total_rows);
+        let batch_len = end - start;
 
-        // Per-batch local aggregation
+        // ═══ Phase 1: agg_generic_hash_path ═══
+        // Build per-batch HashMap. comparator compares two rows within this batch.
         let mut table = HashMap::<IndexHash, u32, IdentityBuildHasher>::with_capacity_and_hasher(
-            (end - start).min(capacity), Default::default(),
+            batch_len.min(capacity), Default::default(),
         );
-        let mut reps: Vec<usize> = Vec::new();
-        let mut sums: Vec<i64> = Vec::new();
+        let mut groupkey_indices: Vec<u64> = Vec::new();
+        let mut group_ids: Vec<u32> = Vec::with_capacity(batch_len);
+        let mut num_groups: u32 = 0;
 
         for i in start..end {
             let h = data.hashes[i];
             let entry = table.raw_entry_mut().from_hash(h, |other| {
                 if h != other.hash { return false; }
-                let oi = other.idx as usize;
-                // Compare all columns
+                let j = other.idx as usize;
+                // comparator(i, j): compare two rows in the same batch
                 for c in 0..data.num_str_cols {
-                    if data.str_cols[c][i] != data.str_cols[c][oi] { return false; }
+                    if data.str_cols[c][i] != data.str_cols[c][j] { return false; }
                 }
                 for c in 0..data.num_int_cols {
-                    if data.int_cols[c][i] != data.int_cols[c][oi] { return false; }
+                    if data.int_cols[c][i] != data.int_cols[c][j] { return false; }
                 }
                 true
             });
-            match entry {
-                RawEntryMut::Occupied(e) => { sums[*e.get() as usize] += data.values[i]; }
+            let gid = match entry {
                 RawEntryMut::Vacant(e) => {
-                    let gid = reps.len() as u32;
+                    let gid = num_groups;
+                    num_groups += 1;
                     e.insert_hashed_nocheck(h, IndexHash { idx: i as u64, hash: h }, gid);
-                    reps.push(i);
-                    sums.push(data.values[i]);
+                    groupkey_indices.push(i as u64);
+                    gid
                 }
-            }
+                RawEntryMut::Occupied(e) => *e.get(),
+            };
+            group_ids.push(gid);
         }
 
-        // Collect partial results
-        for (gid, &rep_idx) in reps.iter().enumerate() {
-            all_partial_indices.push(rep_idx);
-            all_partial_sums.push(sums[gid]);
-            all_partial_hashes.push(data.hashes[rep_idx]);
+        // ═══ Phase 2: accumulate ═══
+        // SumAccumulator: scatter values into per-group slots
+        let mut sums: Vec<i64> = vec![0i64; num_groups as usize];
+        for (row, &gid) in group_ids.iter().enumerate() {
+            sums[gid as usize] += data.values[start + row];
         }
+
+        // ═══ Phase 3: Construct partial result (take + finalize) ═══
+        // groupby_table.take(&groupkey_indices) — copies key data into new Arrow arrays
+        let mut partial_str_cols: Vec<Utf8Column> = Vec::with_capacity(data.num_str_cols);
+        for c in 0..data.num_str_cols {
+            let mut col = Utf8Column::with_capacity(num_groups as usize, 16);
+            for &idx in &groupkey_indices {
+                col.push(&data.str_cols[c][idx as usize]);  // ← string copy (arrow::compute::take)
+            }
+            partial_str_cols.push(col);
+        }
+        let mut partial_int_cols: Vec<Int64Column> = Vec::with_capacity(data.num_int_cols);
+        for c in 0..data.num_int_cols {
+            let mut col = Int64Column::with_capacity(num_groups as usize);
+            for &idx in &groupkey_indices {
+                col.push(data.int_cols[c][idx as usize]);
+            }
+            partial_int_cols.push(col);
+        }
+
+        // Hash column for the partial result (needed for final merge)
+        let partial_hashes: Vec<u64> = groupkey_indices.iter()
+            .map(|&idx| data.hashes[idx as usize])
+            .collect();
+
+        // Push to state.partially_aggregated
+        partial_results.push(PartialResult {
+            str_key_cols: partial_str_cols,
+            int_key_cols: partial_int_cols,
+            hashes: partial_hashes,
+            sums,
+        });
+        // ← per-batch HashMap dropped here, batch data conceptually released
     }
 
-    // Final merge: aggregate all partial results
+    // ═══ Finalize: concat + final agg ═══
+
+    // Step 1: MicroPartition::concat(partially_aggregated)
+    // Concatenate all partial results into one big columnar batch
+    let concat_str_cols: Vec<Utf8Column> = (0..data.num_str_cols).map(|c| {
+        let refs: Vec<&Utf8Column> = partial_results.iter().map(|p| &p.str_key_cols[c]).collect();
+        Utf8Column::concat(&refs)
+    }).collect();
+    let concat_int_cols: Vec<Int64Column> = (0..data.num_int_cols).map(|c| {
+        let refs: Vec<&Int64Column> = partial_results.iter().map(|p| &p.int_key_cols[c]).collect();
+        Int64Column::concat(&refs)
+    }).collect();
+    let concat_hashes: Vec<u64> = partial_results.iter().flat_map(|p| p.hashes.iter().copied()).collect();
+    let concat_sums: Vec<i64> = partial_results.iter().flat_map(|p| p.sums.iter().copied()).collect();
+    let concat_len = concat_hashes.len();
+
+    // Step 2: concated.agg(final_agg_exprs, final_group_by)
+    // Same pattern: HashMap + comparator(i, j) on the concat'd batch
     let mut final_table = HashMap::<IndexHash, u32, IdentityBuildHasher>::with_capacity_and_hasher(
         capacity, Default::default(),
     );
-    let mut final_sums: Vec<i64> = Vec::new();
+    let mut final_groupkey_indices: Vec<u64> = Vec::new();
+    let mut final_group_ids: Vec<u32> = Vec::with_capacity(concat_len);
+    let mut final_num_groups: u32 = 0;
 
-    for (pi, &rep_idx) in all_partial_indices.iter().enumerate() {
-        let h = all_partial_hashes[pi];
+    for i in 0..concat_len {
+        let h = concat_hashes[i];
         let entry = final_table.raw_entry_mut().from_hash(h, |other| {
             if h != other.hash { return false; }
-            let oi = other.idx as usize;
+            let j = other.idx as usize;
+            // comparator(i, j): compare two rows in the concat'd batch
             for c in 0..data.num_str_cols {
-                if data.str_cols[c][rep_idx] != data.str_cols[c][oi] { return false; }
+                if concat_str_cols[c].get(i) != concat_str_cols[c].get(j) { return false; }
             }
             for c in 0..data.num_int_cols {
-                if data.int_cols[c][rep_idx] != data.int_cols[c][oi] { return false; }
+                if concat_int_cols[c].get(i) != concat_int_cols[c].get(j) { return false; }
             }
             true
         });
-        match entry {
-            RawEntryMut::Occupied(e) => { final_sums[*e.get() as usize] += all_partial_sums[pi]; }
+        let gid = match entry {
             RawEntryMut::Vacant(e) => {
-                let gid = final_sums.len() as u32;
-                e.insert_hashed_nocheck(h, IndexHash { idx: rep_idx as u64, hash: h }, gid);
-                final_sums.push(all_partial_sums[pi]);
+                let gid = final_num_groups;
+                final_num_groups += 1;
+                e.insert_hashed_nocheck(h, IndexHash { idx: i as u64, hash: h }, gid);
+                final_groupkey_indices.push(i as u64);
+                gid
             }
-        }
+            RawEntryMut::Occupied(e) => *e.get(),
+        };
+        final_group_ids.push(gid);
     }
+
+    // Final accumulate: SUM of partial SUMs
+    let mut final_sums: Vec<i64> = vec![0i64; final_num_groups as usize];
+    for (row, &gid) in final_group_ids.iter().enumerate() {
+        final_sums[gid as usize] += concat_sums[row];
+    }
+
     black_box(final_sums.len());
 }
 

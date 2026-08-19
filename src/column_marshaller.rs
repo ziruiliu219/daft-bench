@@ -369,6 +369,13 @@ impl TaperColumnSerializeHandler {
 
     pub fn num_groups(&self) -> usize { self.rc.num_rows() }
 
+    /// Output all group results: reads agg values from all rows in RowContainer.
+    /// Mirrors the real engine's "output result to downstream operator" step.
+    /// Returns the sum of all agg values (as a checksum to prevent optimization).
+    pub fn output_agg_checksum(&self) -> i64 {
+        self.rc.agg_i64_checksum(self.agg_offset)
+    }
+
     /// Mirrors C++ `EmplaceTableWithDecode`.
     pub fn emplace_table_with_decode(&mut self, hashes: &[u64], columns: &[ColumnInput], agg_values: &[i64]) {
         assert_eq!(columns.len(), self.col_descs.len());
