@@ -168,6 +168,14 @@ impl Utf8Column {
         let end = self.offsets[idx + 1] as usize;
         &self.data[start..end]
     }
+    /// arrow::compute::take — copy selected rows into a new column.
+    fn take(source: &[Vec<u8>], indices: &[u64]) -> Self {
+        let mut col = Self::with_capacity(indices.len(), 16);
+        for &idx in indices {
+            col.push(&source[idx as usize]);
+        }
+        col
+    }
 }
 
 /// Arrow-style Int64 column
@@ -178,6 +186,14 @@ impl Int64Column {
     fn with_capacity(n: usize) -> Self { Self { values: Vec::with_capacity(n) } }
     #[inline(always)]
     fn get(&self, idx: usize) -> i64 { self.values[idx] }
+    /// arrow::compute::take — copy selected rows into a new column.
+    fn take(source: &[i64], indices: &[u64]) -> Self {
+        let mut col = Self::with_capacity(indices.len());
+        for &idx in indices {
+            col.values.push(source[idx as usize]);
+        }
+        col
+    }
 }
 
 #[inline(never)]
@@ -225,20 +241,12 @@ fn run_daft_staged(data: &MixedBenchData, capacity: usize) {
     }
 
     // ═══ Phase 3: take (copy keys into Arrow arrays — batch released after this) ═══
-    let partial_str_cols: Vec<Utf8Column> = (0..data.num_str_cols).map(|c| {
-        let mut col = Utf8Column::with_capacity(num_groups as usize, 16);
-        for &idx in &groupkey_indices {
-            col.push(&data.str_cols[c][idx as usize]);
-        }
-        col
-    }).collect();
-    let partial_int_cols: Vec<Int64Column> = (0..data.num_int_cols).map(|c| {
-        let mut col = Int64Column::with_capacity(num_groups as usize);
-        for &idx in &groupkey_indices {
-            col.values.push(data.int_cols[c][idx as usize]);
-        }
-        col
-    }).collect();
+    let partial_str_cols: Vec<Utf8Column> = (0..data.num_str_cols)
+        .map(|c| Utf8Column::take(&data.str_cols[c], &groupkey_indices))
+        .collect();
+    let partial_int_cols: Vec<Int64Column> = (0..data.num_int_cols)
+        .map(|c| Int64Column::take(&data.int_cols[c], &groupkey_indices))
+        .collect();
     let partial_hashes: Vec<u64> = groupkey_indices.iter()
         .map(|&idx| data.hashes[idx as usize]).collect();
 
