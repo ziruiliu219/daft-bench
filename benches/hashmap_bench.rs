@@ -425,48 +425,66 @@ fn run_daft_staged(data: &MixedBenchData, capacity: usize) {
 // hashmap comparator can't reference batch memory anymore.
 // Mirrors Taper's RowContainer serialization.
 
-/// Persistent arena for group keys (mirrors Taper's RowContainer).
-struct GroupKeyStore {
-    /// [col][group_id] → owned string bytes
-    str_keys: Vec<Vec<Vec<u8>>>,
-    /// [col][group_id] → i64
-    int_keys: Vec<Vec<i64>>,
+/// Flat arena for serialized group keys (same strategy as Taper's RowContainer).
+/// All key columns are concatenated into one contiguous byte buffer.
+/// Format per row: [int0:8B][int1:8B]...[str0_len:4B][str0_data]...[strN_len:4B][strN_data]
+struct FlatKeyArena {
+    buffer: Vec<u8>,
+    /// (offset, len) for each group's serialized key in buffer
+    entries: Vec<(u32, u32)>,
     num_str_cols: usize,
     num_int_cols: usize,
 }
 
-impl GroupKeyStore {
+impl FlatKeyArena {
     fn new(num_str_cols: usize, num_int_cols: usize) -> Self {
         Self {
-            str_keys: (0..num_str_cols).map(|_| Vec::new()).collect(),
-            int_keys: (0..num_int_cols).map(|_| Vec::new()).collect(),
+            buffer: Vec::with_capacity(1024 * 1024),
+            entries: Vec::new(),
             num_str_cols, num_int_cols,
         }
     }
 
-    /// Copy keys from batch into arena. Returns new group_id.
-    fn push_keys(&mut self, str_cols: &[&[&[u8]]], int_cols: &[&[i64]], row: usize) -> u32 {
-        let gid = if self.num_str_cols > 0 { self.str_keys[0].len() }
-                  else { self.int_keys[0].len() };
-        for c in 0..self.num_str_cols {
-            self.str_keys[c].push(str_cols[c][row].to_vec());
-        }
+    /// Serialize one row's keys into the flat buffer. Returns group_id.
+    fn push_row(&mut self, str_cols: &[&[&[u8]]], int_cols: &[&[i64]], row: usize) -> u32 {
+        let gid = self.entries.len() as u32;
+        let start = self.buffer.len() as u32;
+
+        // Write int keys (fixed 8 bytes each)
         for c in 0..self.num_int_cols {
-            self.int_keys[c].push(int_cols[c][row]);
+            self.buffer.extend_from_slice(&int_cols[c][row].to_le_bytes());
         }
-        gid as u32
+        // Write string keys (4-byte length prefix + data)
+        for c in 0..self.num_str_cols {
+            let s = str_cols[c][row];
+            self.buffer.extend_from_slice(&(s.len() as u32).to_le_bytes());
+            self.buffer.extend_from_slice(s);
+        }
+
+        let len = self.buffer.len() as u32 - start;
+        self.entries.push((start, len));
+        gid
     }
 
-    /// Compare current batch row against arena-stored group keys.
-    fn keys_equal(&self, gid: u32, str_cols: &[&[&[u8]]], int_cols: &[&[i64]], row: usize) -> bool {
-        let g = gid as usize;
-        for c in 0..self.num_str_cols {
-            if self.str_keys[c][g] != str_cols[c][row] { return false; }
+    /// Get serialized key bytes for a group.
+    #[inline(always)]
+    fn get_key(&self, gid: u32) -> &[u8] {
+        let (offset, len) = self.entries[gid as usize];
+        &self.buffer[offset as usize..(offset + len) as usize]
+    }
+
+    /// Serialize a row into a temporary buffer for comparison (no allocation if reused).
+    #[inline]
+    fn serialize_row_into(buf: &mut Vec<u8>, str_cols: &[&[&[u8]]], int_cols: &[&[i64]], row: usize, num_str_cols: usize, num_int_cols: usize) {
+        buf.clear();
+        for c in 0..num_int_cols {
+            buf.extend_from_slice(&int_cols[c][row].to_le_bytes());
         }
-        for c in 0..self.num_int_cols {
-            if self.int_keys[c][g] != int_cols[c][row] { return false; }
+        for c in 0..num_str_cols {
+            let s = str_cols[c][row];
+            buf.extend_from_slice(&(s.len() as u32).to_le_bytes());
+            buf.extend_from_slice(s);
         }
-        true
     }
 }
 
@@ -479,14 +497,14 @@ fn run_hashbrown_persistent(data: &MixedBenchData, capacity: usize) {
         capacity, Default::default(),
     );
     let mut sums: Vec<i64> = Vec::new();
-    let mut store = GroupKeyStore::new(data.num_str_cols, data.num_int_cols);
+    let mut arena = FlatKeyArena::new(data.num_str_cols, data.num_int_cols);
+    let mut cmp_buf: Vec<u8> = Vec::with_capacity(256); // reusable temp buffer for comparison
 
     for batch_idx in 0..num_batches {
         let start = batch_idx * BATCH_SIZE;
         let end = (start + BATCH_SIZE).min(total_rows);
         let batch_len = end - start;
 
-        // Slice refs into the batch data (no copy — batch data is alive during processing)
         let str_slices: Vec<Vec<&[u8]>> = (0..data.num_str_cols)
             .map(|c| data.str_cols[c][start..end].iter().map(|s| s.as_slice()).collect())
             .collect();
@@ -498,18 +516,21 @@ fn run_hashbrown_persistent(data: &MixedBenchData, capacity: usize) {
 
         for row in 0..batch_len {
             let h = data.hashes[start + row];
+
+            // Serialize current row into temp buffer for comparison
+            FlatKeyArena::serialize_row_into(&mut cmp_buf, &str_refs, &int_refs, row, data.num_str_cols, data.num_int_cols);
+
             let entry = table.raw_entry_mut().from_hash(h, |other| {
                 if h != other.hash { return false; }
-                // Compare current batch row against arena-stored keys
-                store.keys_equal(other.idx as u32, &str_refs, &int_refs, row)
+                // Single memcmp: arena bytes vs serialized current row
+                arena.get_key(other.idx as u32) == cmp_buf.as_slice()
             });
             match entry {
                 RawEntryMut::Occupied(e) => {
                     sums[*e.get() as usize] += data.values[start + row];
                 }
                 RawEntryMut::Vacant(e) => {
-                    // Only copy: new key into persistent arena
-                    let gid = store.push_keys(&str_refs, &int_refs, row);
+                    let gid = arena.push_row(&str_refs, &int_refs, row);
                     e.insert_hashed_nocheck(h, IndexHash { idx: gid as u64, hash: h }, gid);
                     sums.push(data.values[start + row]);
                 }
