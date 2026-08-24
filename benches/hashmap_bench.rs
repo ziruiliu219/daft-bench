@@ -418,107 +418,6 @@ fn run_daft_staged(data: &MixedBenchData, capacity: usize) {
 
 // ═══════════════════════════════════════════════════════════════════
 // Hashbrown persistent runner: single hash table across all batches
-// (same pattern as Taper — no per-batch rebuild)
-//
-// Key data is COPIED into a persistent arena on first insert.
-// This is mandatory in real engines: once a batch is released, the
-// hashmap comparator can't reference batch memory anymore.
-// Mirrors Taper's RowContainer serialization.
-
-/// Persistent arena for group keys (mirrors Taper's RowContainer).
-struct GroupKeyStore {
-    /// [col][group_id] → owned string bytes
-    str_keys: Vec<Vec<Vec<u8>>>,
-    /// [col][group_id] → i64
-    int_keys: Vec<Vec<i64>>,
-    num_str_cols: usize,
-    num_int_cols: usize,
-}
-
-impl GroupKeyStore {
-    fn new(num_str_cols: usize, num_int_cols: usize) -> Self {
-        Self {
-            str_keys: (0..num_str_cols).map(|_| Vec::new()).collect(),
-            int_keys: (0..num_int_cols).map(|_| Vec::new()).collect(),
-            num_str_cols, num_int_cols,
-        }
-    }
-
-    /// Copy keys from batch into arena. Returns new group_id.
-    fn push_keys(&mut self, str_cols: &[&[&[u8]]], int_cols: &[&[i64]], row: usize) -> u32 {
-        let gid = if self.num_str_cols > 0 { self.str_keys[0].len() }
-                  else { self.int_keys[0].len() };
-        for c in 0..self.num_str_cols {
-            self.str_keys[c].push(str_cols[c][row].to_vec());
-        }
-        for c in 0..self.num_int_cols {
-            self.int_keys[c].push(int_cols[c][row]);
-        }
-        gid as u32
-    }
-
-    /// Compare current batch row against arena-stored group keys.
-    fn keys_equal(&self, gid: u32, str_cols: &[&[&[u8]]], int_cols: &[&[i64]], row: usize) -> bool {
-        let g = gid as usize;
-        for c in 0..self.num_str_cols {
-            if self.str_keys[c][g] != str_cols[c][row] { return false; }
-        }
-        for c in 0..self.num_int_cols {
-            if self.int_keys[c][g] != int_cols[c][row] { return false; }
-        }
-        true
-    }
-}
-
-#[inline(never)]
-fn run_hashbrown_persistent(data: &MixedBenchData, capacity: usize) {
-    let total_rows = data.hashes.len();
-    let num_batches = (total_rows + BATCH_SIZE - 1) / BATCH_SIZE;
-
-    let mut table = HashMap::<IndexHash, u32, IdentityBuildHasher>::with_capacity_and_hasher(
-        capacity, Default::default(),
-    );
-    let mut sums: Vec<i64> = Vec::new();
-    let mut store = GroupKeyStore::new(data.num_str_cols, data.num_int_cols);
-
-    for batch_idx in 0..num_batches {
-        let start = batch_idx * BATCH_SIZE;
-        let end = (start + BATCH_SIZE).min(total_rows);
-        let batch_len = end - start;
-
-        // Slice refs into the batch data (no copy — batch data is alive during processing)
-        let str_slices: Vec<Vec<&[u8]>> = (0..data.num_str_cols)
-            .map(|c| data.str_cols[c][start..end].iter().map(|s| s.as_slice()).collect())
-            .collect();
-        let int_slices: Vec<&[i64]> = (0..data.num_int_cols)
-            .map(|c| &data.int_cols[c][start..end])
-            .collect();
-        let str_refs: Vec<&[&[u8]]> = str_slices.iter().map(|v| v.as_slice()).collect();
-        let int_refs: Vec<&[i64]> = int_slices.iter().map(|s| *s).collect();
-
-        for row in 0..batch_len {
-            let h = data.hashes[start + row];
-            let entry = table.raw_entry_mut().from_hash(h, |other| {
-                if h != other.hash { return false; }
-                // Compare current batch row against arena-stored keys
-                store.keys_equal(other.idx as u32, &str_refs, &int_refs, row)
-            });
-            match entry {
-                RawEntryMut::Occupied(e) => {
-                    sums[*e.get() as usize] += data.values[start + row];
-                }
-                RawEntryMut::Vacant(e) => {
-                    // Only copy: new key into persistent arena
-                    let gid = store.push_keys(&str_refs, &int_refs, row);
-                    e.insert_hashed_nocheck(h, IndexHash { idx: gid as u64, hash: h }, gid);
-                    sums.push(data.values[start + row]);
-                }
-            }
-        }
-    }
-    black_box(sums.len());
-}
-
 // ═══════════════════════════════════════════════════════════════════
 // Benchmark registration
 
@@ -553,9 +452,6 @@ fn bench_hashagg(c: &mut Criterion) {
 
                     group.bench_with_input(BenchmarkId::new("taper", &param), &data, |b, d| {
                         b.iter(|| run_taper_mixed(black_box(d), num_chunks));
-                    });
-                    group.bench_with_input(BenchmarkId::new("hashbrown_persistent", &param), &data, |b, d| {
-                        b.iter(|| run_hashbrown_persistent(black_box(d), daft_capacity));
                     });
                     group.bench_with_input(BenchmarkId::new("daft_staged", &param), &data, |b, d| {
                         b.iter(|| run_daft_staged(black_box(d), daft_capacity));
