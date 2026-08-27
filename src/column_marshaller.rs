@@ -369,6 +369,9 @@ impl TaperColumnSerializeHandler {
 
     pub fn num_groups(&self) -> usize { self.rc.num_rows() }
 
+    /// Number of chunks in the underlying hash table (grows on rehash).
+    pub fn map_num_chunks(&self) -> usize { self.map.num_chunks() }
+
     /// Output all group results: reads agg values from all rows in RowContainer.
     /// Mirrors the real engine's "output result to downstream operator" step.
     /// Returns the sum of all agg values (as a checksum to prevent optimization).

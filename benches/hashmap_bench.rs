@@ -123,7 +123,7 @@ fn generate_mixed_data(
 const BATCH_SIZE: usize = 410;
 
 #[inline(never)]
-fn run_taper_mixed(data: &MixedBenchData, num_chunks: usize) {
+fn run_taper_mixed(data: &MixedBenchData, num_chunks: usize) -> usize {
     let mut col_descs: Vec<ColumnDesc> = Vec::new();
     for _ in 0..data.num_str_cols { col_descs.push(ColumnDesc::Varchar); }
     for _ in 0..data.num_int_cols { col_descs.push(ColumnDesc::Int64); }
@@ -149,6 +149,8 @@ fn run_taper_mixed(data: &MixedBenchData, num_chunks: usize) {
         table.emplace_table_with_decode(batch_hashes, &columns, batch_values);
     }
     black_box(table.num_groups());
+    // Return final chunk count so callers can verify rehash occurred.
+    table.map_num_chunks()
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -461,6 +463,18 @@ fn bench_hashagg(c: &mut Criterion) {
 
                     // Taper: start from 1 chunk, matching OmniOperator Base::Init(0) (grows via 2x rehash)
                     let num_chunks = 1;
+
+                    // Verify rehash actually happens: run once, check final chunk count grew past initial.
+                    let final_chunks = run_taper_mixed(&data, num_chunks);
+                    assert!(
+                        final_chunks > num_chunks,
+                        "REHASH NOT TRIGGERED for {}: started {} chunks, ended {} chunks (distinct_keys={})",
+                        param, num_chunks, final_chunks, distinct_keys
+                    );
+                    eprintln!(
+                        "[rehash-verify] {}: 1 -> {} chunks ({} rehashes, distinct_keys={})",
+                        param, final_chunks, (final_chunks as f64).log2() as u32, distinct_keys
+                    );
 
                     group.bench_with_input(BenchmarkId::new("taper", &param), &data, |b, d| {
                         b.iter(|| run_taper_mixed(black_box(d), num_chunks));
