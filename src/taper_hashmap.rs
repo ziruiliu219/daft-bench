@@ -179,8 +179,9 @@ impl TaperHashMap {
         FInit: FnMut(&mut SlotValue),
         FUpdate: FnMut(&SlotValue, bool), // (slot_value, is_new)
     {
+        // Single-row path → ExpandCapacityDirectly (matches C++ EmplaceImpl).
         if self.should_expand() {
-            self.expand_capacity_iteratively();
+            self.expand_capacity_directly();
         }
 
         let tag_hash = ((hash >> 16) & 0x7F) as u8;
@@ -588,7 +589,65 @@ impl TaperHashMap {
         }
     }
 
-    // ─── Expand capacity (mirrors C++ ExpandCapacityIteratively) ───────────────
+    // ─── Expand capacity — Directly (mirrors C++ ExpandCapacityDirectly) ───────
+    // Used by the single-row emplace path (EmplaceImpl). Rehash by walking old
+    // chunks and re-inserting each element one at a time via RehashEmplace
+    // (single-row insert-only, linear probe on full chunk). No prefetch, no
+    // two-pass collision batching.
+    fn expand_capacity_directly(&mut self) {
+        let old_chunks = self.chunks;
+        let old_num = self.num_chunks;
+
+        // Init(ExpandLastChunkIdx()): allocate new 2x chunk array, reset size.
+        let new_len = self.num_chunks * 2;
+        self.chunks = unsafe { alloc_chunks(new_len) };
+        self.num_chunks = new_len;
+        self.mask = new_len - 1;
+        self.size = 0;
+
+        // Walk old chunks, re-insert each element (RehashEmplace = single-row
+        // insert-only). No key comparison during rehash.
+        for ci in 0..old_num {
+            let chunk = unsafe { &*old_chunks.add(ci) };
+            for slot_idx in 0..SLOTS_PER_CHUNK {
+                if chunk.tags[slot_idx] != 0x80 {
+                    let hash = chunk.keys[slot_idx];
+                    let value = chunk.values[slot_idx];
+                    self.rehash_emplace(hash, value);
+                }
+            }
+        }
+
+        // FreeChunkMemory(oldChunks, oldLastChunkIdx)
+        unsafe { libc::free(old_chunks as *mut libc::c_void); }
+    }
+
+    // RehashEmplace: single-row insert-only into the (new) table. Linear probe
+    // via rehash_pos when a chunk is full. Mirrors C++ RehashEmplace →
+    // EmplaceImpl<InsertOnly=true>.
+    fn rehash_emplace(&mut self, hash: u64, value: SlotValue) {
+        let tag_hash = ((hash >> 16) & 0x7F) as u8;
+        let mut pos = self.chunk_pos(hash);
+        let mut collision_batch = 1usize;
+        loop {
+            let chunk = unsafe { &mut *self.chunks.add(pos) };
+            let tags = chunk.tags_u64();
+            if let Some(i) = BitMask::match_empty(tags).next() {
+                let slot = i as usize;
+                chunk.tags[slot] = tag_hash;
+                chunk.keys[slot] = hash;
+                chunk.values[slot] = value;
+                self.size += 1;
+                return;
+            }
+            // Chunk full → linear probe
+            pos = self.rehash_pos(collision_batch, pos);
+            collision_batch += 1;
+        }
+    }
+
+    // ─── Expand capacity — Iteratively (mirrors C++ ExpandCapacityIteratively) ─
+    // Used by the batch emplace path (EmplaceBatchImpl).
     // 1. Save old chunks
     // 2. Init(2x) — allocate new chunk array, reset size
     // 3. RehashChunksIteratively(oldChunks, oldChunksNum)  →  RehashBatch
