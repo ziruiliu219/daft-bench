@@ -454,12 +454,13 @@ fn bench_hashagg(c: &mut Criterion) {
                     let data = generate_mixed_data(num_str, num_int, num_keys, num_probe_rows, selectivity, &mut rng);
                     let param = format!("{}_ht={}_lf={:.2}_sel={:.1}", type_name, ht_size, load_factor, selectivity);
 
-                    // Pre-allocate to avoid rehash
+                    // Daft hashbrown init capacity (real source: min(rows,1024).max(1), handled per-batch inside runner)
                     let num_misses = num_probe_rows - (num_probe_rows as f64 * selectivity) as usize;
                     let distinct_keys = num_keys + num_misses;
-                    let min_slots = ((distinct_keys as f64 / 0.85) as usize).max(8);
-                    let num_chunks = ((min_slots + 7) / 8).next_power_of_two();
                     let daft_capacity = ((distinct_keys as f64 / 0.75) as usize).max(8);
+
+                    // Taper: start from 1 chunk, matching OmniOperator Base::Init(0) (grows via 2x rehash)
+                    let num_chunks = 1;
 
                     group.bench_with_input(BenchmarkId::new("taper", &param), &data, |b, d| {
                         b.iter(|| run_taper_mixed(black_box(d), num_chunks));
