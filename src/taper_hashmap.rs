@@ -19,6 +19,13 @@ pub struct TaperHashMap {
     num_chunks: usize,
     size: usize,
     mask: usize, // num_chunks - 1 (power of 2)
+
+    // Rehash context — reused member buffers, mirrors C++ rehashContext_.
+    // Avoids per-rehash heap allocation (matches OmniOperator BatchContext).
+    rehash_hash_vals: Vec<u64>,
+    rehash_positions: Vec<usize>,
+    rehash_collision_src: Vec<(u64, SlotValue)>, // (hash, value) of src elements
+    rehash_collision_indices: Vec<usize>,        // indices into rehash_collision_src for next batch
 }
 
 impl Drop for TaperHashMap {
@@ -56,6 +63,10 @@ impl TaperHashMap {
             num_chunks,
             mask: num_chunks - 1,
             size: 0,
+            rehash_hash_vals: Vec::new(),
+            rehash_positions: Vec::new(),
+            rehash_collision_src: Vec::new(),
+            rehash_collision_indices: Vec::new(),
         }
     }
 
@@ -577,81 +588,71 @@ impl TaperHashMap {
         }
     }
 
-    // ─── Expand with iterative batch rehash + prefetch ─────────────────────────
-    // Mirrors C++ RehashBatch + RehashChunksIteratively:
-    // 1. Allocate new chunk array (2x size)
-    // 2. Collect all occupied slots' (hash, value) from old chunks
-    // 3. Compute target chunk positions for all entries
-    // 4. Prefetch-driven insertion with collision iteration
-
-    /// Expand capacity by 2x and rehash all elements using iterative batch rehash.
+    // ─── Expand capacity (mirrors C++ ExpandCapacityIteratively) ───────────────
+    // 1. Save old chunks
+    // 2. Init(2x) — allocate new chunk array, reset size
+    // 3. RehashChunksIteratively(oldChunks, oldChunksNum)  →  RehashBatch
+    // 4. FreeChunkMemory(oldChunks)
     fn expand_capacity_iteratively(&mut self) {
-        let new_len = self.num_chunks * 2;
         let old_chunks = self.chunks;
         let old_num = self.num_chunks;
 
-        // Allocate new chunk array (same as OmniOperator ExpandCapacityIteratively)
+        // Init(ExpandLastChunkIdx()): allocate new 2x chunk array, reset size.
+        let new_len = self.num_chunks * 2;
         self.chunks = unsafe { alloc_chunks(new_len) };
         self.num_chunks = new_len;
         self.mask = new_len - 1;
         self.size = 0;
 
-        // Collect all occupied entries from old chunks
-        let mut entries: Vec<(u64, SlotValue)> = Vec::with_capacity(old_num * SLOTS_PER_CHUNK);
+        // RehashChunksIteratively → RehashBatch over old chunks.
+        self.rehash_batch(old_chunks, old_num);
+
+        // FreeChunkMemory(oldChunks, oldLastChunkIdx)
+        unsafe { libc::free(old_chunks as *mut libc::c_void); }
+    }
+
+    // ─── RehashBatch (mirrors C++ TaperFlatHashTable::RehashBatch) ─────────────
+    // Reuses member buffers (rehash_hash_vals / rehash_positions /
+    // rehash_collision_src / rehash_collision_indices) = C++ rehashContext_.
+    // Two-pass: pass 1 sequential scan of old chunks + insert; pass 2+ iterate
+    // collisions with collisionBatch++. Insert-only (no key compare during rehash).
+    fn rehash_batch(&mut self, old_chunks: *mut Chunk, old_num: usize) {
+        // ResetRehashContext: gather src (hash,value) + initial target positions.
+        // (C++ visitor walks old chunks lazily; here we materialize once into the
+        //  reused member buffers, keeping the same two-pass collision structure.)
+        self.rehash_collision_src.clear();
+        self.rehash_hash_vals.clear();
+        self.rehash_positions.clear();
         for ci in 0..old_num {
             let chunk = unsafe { &*old_chunks.add(ci) };
             for slot_idx in 0..SLOTS_PER_CHUNK {
                 if chunk.tags[slot_idx] != 0x80 {
-                    entries.push((chunk.keys[slot_idx], chunk.values[slot_idx]));
+                    let hash = chunk.keys[slot_idx];
+                    self.rehash_collision_src.push((hash, chunk.values[slot_idx]));
+                    self.rehash_hash_vals.push(hash);
+                    self.rehash_positions.push(self.chunk_pos(hash));
                 }
             }
         }
-
-        // Free old chunks (same as OmniOperator: free(oldChunks))
-        unsafe { libc::free(old_chunks as *mut libc::c_void); }
-
-        let n = entries.len();
+        let n = self.rehash_collision_src.len();
         if n == 0 {
             return;
         }
 
-        // Compute initial target chunk positions
-        let mut positions: Vec<usize> = entries.iter().map(|(h, _)| self.chunk_pos(*h)).collect();
-
-        // Iterative collision resolution with prefetch (mirrors C++ RehashBatch)
-        // Active indices: entries that still need to be inserted
-        let mut active_indices: Vec<usize> = (0..n).collect();
         let mut collision_batch = 1usize;
+        let mut collision_count = 0usize;
 
-        loop {
-            let count = active_indices.len();
-            if count == 0 {
-                break;
-            }
-
-            // Prefetch first PREFETCH_DIST target chunks
-            for pi in 0..PREFETCH_DIST.min(count) {
-                self.prefetch_chunk(positions[active_indices[pi]]);
-            }
-
-            let mut collision_indices: Vec<usize> = Vec::new();
-
-            for idx in 0..count {
-                // Prefetch ahead
-                let pi = idx + PREFETCH_DIST;
-                if pi < count {
-                    self.prefetch_chunk(positions[active_indices[pi]]);
-                }
-
-                let entry_idx = active_indices[idx];
-                let (hash, value) = entries[entry_idx];
-                let pos = positions[entry_idx];
+        // tryEmplace: try insert src[src_item_idx] at positions[src_item_idx].
+        // On failure, record into collision buffers at collision_count and bump.
+        // Returns nothing; mirrors C++ lambda closure over collisionCount.
+        macro_rules! try_emplace {
+            ($src_item_idx:expr, $orig_idx:expr) => {{
+                let src_item_idx = $src_item_idx;
+                let (hash, value) = self.rehash_collision_src[$orig_idx];
+                let pos = self.rehash_positions[src_item_idx];
                 let tag_hash = ((hash >> 16) & 0x7F) as u8;
-
                 let chunk = unsafe { &mut *self.chunks.add(pos) };
                 let tags = chunk.tags_u64();
-
-                // During rehash: insert-only, no key comparison needed
                 if let Some(i) = BitMask::match_empty(tags).next() {
                     let slot = i as usize;
                     chunk.tags[slot] = tag_hash;
@@ -659,14 +660,42 @@ impl TaperHashMap {
                     chunk.values[slot] = value;
                     self.size += 1;
                 } else {
-                    // Chunk full → record for next collision batch
-                    positions[entry_idx] = self.rehash_pos(collision_batch, pos);
-                    collision_indices.push(entry_idx);
+                    // recorder(): collisionIndices[collisionCount] = orig element
+                    self.rehash_collision_indices[collision_count] = $orig_idx;
+                    self.rehash_hash_vals[collision_count] = self.rehash_hash_vals[src_item_idx];
+                    self.rehash_positions[collision_count] =
+                        self.rehash_pos(collision_batch, self.rehash_positions[src_item_idx]);
+                    collision_count += 1;
                 }
-            }
+            }};
+        }
 
-            active_indices = collision_indices;
+        // collision_indices buffer needs room for up to n entries.
+        self.rehash_collision_indices.resize(n, 0);
+
+        // Pass 1: sequential scan, try insert all, collect collisions.
+        for src_item_idx in 0..n {
+            // prefetch ahead
+            let pi = src_item_idx + PREFETCH_DIST;
+            if pi < n {
+                self.prefetch_chunk(self.rehash_positions[pi]);
+            }
+            try_emplace!(src_item_idx, src_item_idx);
+        }
+
+        // Pass 2+: iterate collisions, collisionBatch++ each round.
+        while collision_count > 0 {
+            let cur_count = collision_count;
+            collision_count = 0;
             collision_batch += 1;
+            for src_item_idx in 0..cur_count {
+                let pi = src_item_idx + PREFETCH_DIST;
+                if pi < cur_count {
+                    self.prefetch_chunk(self.rehash_positions[pi]);
+                }
+                let orig_idx = self.rehash_collision_indices[src_item_idx];
+                try_emplace!(src_item_idx, orig_idx);
+            }
         }
     }
 }
