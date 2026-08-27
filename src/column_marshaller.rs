@@ -405,7 +405,7 @@ impl TaperColumnSerializeHandler {
         let groups_ptr = self.groups.as_mut_ptr();
         let update_indices_ptr = &mut self.update_indices as *mut Vec<u32>;
 
-        self.map.emplace_batch_full(
+        self.map.emplace_batch_impl(
             hashes,
             &|_: usize, _: &SlotValue| -> bool { true },
             &mut |i: usize, sv: &mut SlotValue| {

@@ -167,7 +167,7 @@ impl TaperHashMap {
         FUpdate: FnMut(&SlotValue, bool), // (slot_value, is_new)
     {
         if self.should_expand() {
-            self.expand();
+            self.expand_capacity_iteratively();
         }
 
         let tag_hash = ((hash >> 16) & 0x7F) as u8;
@@ -264,7 +264,7 @@ impl TaperHashMap {
     // 4. Collision while loop: iterate collisions, increment collisionBatch each round
     //    - On expand: same resizeProc
 
-    pub fn emplace_batch_full<FKeyCmp, FInit, FUpdate>(
+    pub fn emplace_batch_impl<FKeyCmp, FInit, FUpdate>(
         &mut self,
         hashes: &[u64],
         key_cmp: &FKeyCmp,
@@ -382,7 +382,7 @@ impl TaperHashMap {
                 emplace_positions[collision_count] = self.rehash_pos(collision_batch, emplace_positions[i]);
                 collision_count += 1;
                 if self.should_expand() {
-                    self.expand();
+                    self.expand_capacity_iteratively();
                     // resizeProc
                     collision_batch = 1;
                     try_emplace_rehashed_collisions!(self);
@@ -410,7 +410,7 @@ impl TaperHashMap {
                     emplace_positions[collision_count] = self.rehash_pos(collision_batch, emplace_positions[idx]);
                     collision_count += 1;
                     if self.should_expand() {
-                        self.expand();
+                        self.expand_capacity_iteratively();
                         collision_batch = 1;
                         try_emplace_rehashed_collisions!(self);
                         let mask = self.mask;
@@ -475,7 +475,7 @@ impl TaperHashMap {
             }
 
             if self.should_expand() {
-                self.expand();
+                self.expand_capacity_iteratively();
                 for &row_idx in &active {
                     positions[row_idx as usize] = self.chunk_pos(hashes[row_idx as usize]);
                 }
@@ -583,7 +583,7 @@ impl TaperHashMap {
     // 4. Prefetch-driven insertion with collision iteration
 
     /// Expand capacity by 2x and rehash all elements using iterative batch rehash.
-    fn expand(&mut self) {
+    fn expand_capacity_iteratively(&mut self) {
         let new_len = self.num_chunks * 2;
         let old_chunks = self.chunks;
         let old_num = self.num_chunks;
