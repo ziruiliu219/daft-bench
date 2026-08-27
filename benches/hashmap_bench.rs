@@ -280,8 +280,10 @@ fn run_daft_staged(data: &MixedBenchData, capacity: usize) {
 
         // ═══ Phase 1: agg_generic_hash_path ═══
         // Build per-batch HashMap. comparator compares two rows within this batch.
+        // Daft real source: initial_capacity = min(num_rows, 1024).max(1)
+        let init_cap = batch_len.min(1024).max(1);
         let mut table = HashMap::<IndexHash, u32, IdentityBuildHasher>::with_capacity_and_hasher(
-            batch_len.min(capacity), Default::default(),
+            init_cap, Default::default(),
         );
         let mut groupkey_indices: Vec<u64> = Vec::new();
         let mut group_ids: Vec<u32> = Vec::with_capacity(batch_len);
@@ -373,8 +375,10 @@ fn run_daft_staged(data: &MixedBenchData, capacity: usize) {
 
     // Step 2: concated.agg(final_agg_exprs, final_group_by)
     // Same pattern: HashMap + comparator(i, j) on the concat'd batch
+    // Daft real source: initial_capacity = min(num_rows, 1024).max(1)
+    let final_init_cap = concat_len.min(1024).max(1);
     let mut final_table = HashMap::<IndexHash, u32, IdentityBuildHasher>::with_capacity_and_hasher(
-        capacity, Default::default(),
+        final_init_cap, Default::default(),
     );
     let mut final_groupkey_indices: Vec<u64> = Vec::new();
     let mut final_group_ids: Vec<u32> = Vec::with_capacity(concat_len);
