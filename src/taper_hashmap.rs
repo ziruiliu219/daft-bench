@@ -8,6 +8,15 @@ const SLOTS_PER_CHUNK: usize = 8;
 /// Matches C++ `kHashMapPrefetchDist = 16`.
 const PREFETCH_DIST: usize = 16;
 
+/// Position of an element in the old table during rehash, mirrors C++
+/// `VisitorPos { chunkIdx, tagPos }`. Used to read key/value lazily from the
+/// old chunks (matching C++ visitor.CurKey()/CurVal()), avoiding value copies.
+#[derive(Clone, Copy)]
+struct VisitorPos {
+    chunk_idx: usize, // index into the old chunk array (relative to segment `from`)
+    slot: usize,      // slot within the chunk
+}
+
 /// L1 data cache size assumption, matches C++ `kL1DataSize = 64 * 1024`.
 const L1_DATA_SIZE: usize = 64 * 1024;
 
@@ -31,10 +40,13 @@ pub struct TaperHashMap {
 
     // Rehash context — reused member buffers, mirrors C++ rehashContext_.
     // Avoids per-rehash heap allocation (matches OmniOperator BatchContext).
+    // Values are NOT copied out: read lazily from the old table via visitor
+    // position, exactly like C++ (visitor.CurVal()). collisionIndices stores
+    // the source element's position in the old table (VisitorPos), same as C++.
     rehash_hash_vals: Vec<u64>,
     rehash_positions: Vec<usize>,
-    rehash_collision_src: Vec<(u64, SlotValue)>, // (hash, value) of src elements
-    rehash_collision_indices: Vec<usize>,        // indices into rehash_collision_src for next batch
+    rehash_src_positions: Vec<VisitorPos>,     // old-table pos of each src element
+    rehash_collision_indices: Vec<VisitorPos>, // old-table positions (= C++ VisitorPos)
 }
 
 impl Drop for TaperHashMap {
@@ -74,7 +86,7 @@ impl TaperHashMap {
             size: 0,
             rehash_hash_vals: Vec::new(),
             rehash_positions: Vec::new(),
-            rehash_collision_src: Vec::new(),
+            rehash_src_positions: Vec::new(),
             rehash_collision_indices: Vec::new(),
         }
     }
@@ -693,37 +705,46 @@ impl TaperHashMap {
     // Two-pass: pass 1 sequential scan of segment + insert; pass 2+ iterate
     // collisions with collisionBatch++. Insert-only (no key compare during rehash).
     fn rehash_batch(&mut self, old_chunks: *mut Chunk, from_chunk: usize, end_chunk: usize) {
-        // ResetRehashContext: gather src (hash,value) + initial target positions
-        // for this segment only.
-        self.rehash_collision_src.clear();
+        // ── ResetRehashContext(visitor) ──
+        // Walk old chunks in this segment; for each occupied slot record its
+        // hash (= key, since Hash is identity) and target chunk position. Values
+        // are NOT copied — they are read lazily from the old table when needed
+        // (matching C++ visitor.CurVal()). We remember each element's old-table
+        // position (VisitorPos) so collisions can re-read key/value from old chunks.
         self.rehash_hash_vals.clear();
         self.rehash_positions.clear();
+        self.rehash_src_positions.clear();
         for ci in from_chunk..end_chunk {
             let chunk = unsafe { &*old_chunks.add(ci) };
             for slot_idx in 0..SLOTS_PER_CHUNK {
                 if chunk.tags[slot_idx] != 0x80 {
-                    let hash = chunk.keys[slot_idx];
-                    self.rehash_collision_src.push((hash, chunk.values[slot_idx]));
+                    let hash = chunk.keys[slot_idx]; // Hash(key)=key (KeyScattered)
                     self.rehash_hash_vals.push(hash);
                     self.rehash_positions.push(self.chunk_pos(hash));
+                    self.rehash_src_positions.push(VisitorPos { chunk_idx: ci, slot: slot_idx });
                 }
             }
         }
-        let n = self.rehash_collision_src.len();
+        let n = self.rehash_hash_vals.len();
         if n == 0 {
             return;
         }
+        self.rehash_collision_indices.resize(n, VisitorPos { chunk_idx: 0, slot: 0 });
 
         let mut collision_batch = 1usize;
         let mut collision_count = 0usize;
 
-        // tryEmplace: try insert src[src_item_idx] at positions[src_item_idx].
-        // On failure, record into collision buffers at collision_count and bump.
-        // Returns nothing; mirrors C++ lambda closure over collisionCount.
+        // tryEmplace(vPos, src_item_idx): try inserting the element whose old-table
+        // position is `v_pos` at rehash_positions[src_item_idx]. On failure, record
+        // into the reused collision buffers at collision_count (mirrors C++ lambda).
         macro_rules! try_emplace {
-            ($src_item_idx:expr, $orig_idx:expr) => {{
+            ($v_pos:expr, $src_item_idx:expr) => {{
                 let src_item_idx = $src_item_idx;
-                let (hash, value) = self.rehash_collision_src[$orig_idx];
+                let v_pos: VisitorPos = $v_pos;
+                // Read key/value lazily from the OLD table (= visitor.CurKey/CurVal).
+                let old_chunk = unsafe { &*old_chunks.add(v_pos.chunk_idx) };
+                let hash = old_chunk.keys[v_pos.slot];
+                let value = old_chunk.values[v_pos.slot];
                 let pos = self.rehash_positions[src_item_idx];
                 let tag_hash = ((hash >> 16) & 0x7F) as u8;
                 let chunk = unsafe { &mut *self.chunks.add(pos) };
@@ -735,8 +756,8 @@ impl TaperHashMap {
                     chunk.values[slot] = value;
                     self.size += 1;
                 } else {
-                    // recorder(): collisionIndices[collisionCount] = orig element
-                    self.rehash_collision_indices[collision_count] = $orig_idx;
+                    // recorder(): collisionIndices[collisionCount] = vPos
+                    self.rehash_collision_indices[collision_count] = v_pos;
                     self.rehash_hash_vals[collision_count] = self.rehash_hash_vals[src_item_idx];
                     self.rehash_positions[collision_count] =
                         self.rehash_pos(collision_batch, self.rehash_positions[src_item_idx]);
@@ -745,17 +766,13 @@ impl TaperHashMap {
             }};
         }
 
-        // collision_indices buffer needs room for up to n entries.
-        self.rehash_collision_indices.resize(n, 0);
-
-        // Pass 1: sequential scan, try insert all, collect collisions.
+        // Pass 1: sequential scan of old elements, try insert, collect collisions.
         for src_item_idx in 0..n {
-            // prefetch ahead
             let pi = src_item_idx + PREFETCH_DIST;
             if pi < n {
                 self.prefetch_chunk(self.rehash_positions[pi]);
             }
-            try_emplace!(src_item_idx, src_item_idx);
+            try_emplace!(self.rehash_src_positions[src_item_idx], src_item_idx);
         }
 
         // Pass 2+: iterate collisions, collisionBatch++ each round.
@@ -768,8 +785,8 @@ impl TaperHashMap {
                 if pi < cur_count {
                     self.prefetch_chunk(self.rehash_positions[pi]);
                 }
-                let orig_idx = self.rehash_collision_indices[src_item_idx];
-                try_emplace!(src_item_idx, orig_idx);
+                let v_pos = self.rehash_collision_indices[src_item_idx];
+                try_emplace!(v_pos, src_item_idx);
             }
         }
     }
