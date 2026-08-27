@@ -8,6 +8,15 @@ const SLOTS_PER_CHUNK: usize = 8;
 /// Matches C++ `kHashMapPrefetchDist = 16`.
 const PREFETCH_DIST: usize = 16;
 
+/// L1 data cache size assumption, matches C++ `kL1DataSize = 64 * 1024`.
+const L1_DATA_SIZE: usize = 64 * 1024;
+
+/// Rehash chunk-segment step: process this many old chunks per RehashBatch,
+/// keeping the segment within 3/4 of L1. Matches C++ RehashChunksIteratively:
+///   kStep = kL1DataSize / sizeof(Chunk) * 3 / 4
+/// sizeof(Chunk) == 128, so kStep = 65536 / 128 * 3 / 4 = 384.
+const REHASH_STEP: usize = L1_DATA_SIZE / 128 * 3 / 4;
+
 /// TaperHashMap: chunked open-addressing hash table.
 /// Key = u64 (hash value), Value = 6-byte compressed pointer.
 ///
@@ -663,26 +672,33 @@ impl TaperHashMap {
         self.mask = new_len - 1;
         self.size = 0;
 
-        // RehashChunksIteratively → RehashBatch over old chunks.
-        self.rehash_batch(old_chunks, old_num);
+        // RehashChunksIteratively: process old chunks in L1-sized segments,
+        // calling RehashBatch on each [from_chunk, end_chunk) range.
+        // Matches C++ RehashChunksIteratively (kStep = L1/128*3/4 chunks per batch).
+        let mut chunk_end_idx = 0usize;
+        while chunk_end_idx < old_num {
+            let from_chunk = chunk_end_idx;
+            chunk_end_idx = (chunk_end_idx + REHASH_STEP).min(old_num);
+            self.rehash_batch(old_chunks, from_chunk, chunk_end_idx);
+        }
 
         // FreeChunkMemory(oldChunks, oldLastChunkIdx)
         unsafe { libc::free(old_chunks as *mut libc::c_void); }
     }
 
     // ─── RehashBatch (mirrors C++ TaperFlatHashTable::RehashBatch) ─────────────
+    // Processes old chunks in range [from_chunk, end_chunk) (one L1-sized segment).
     // Reuses member buffers (rehash_hash_vals / rehash_positions /
     // rehash_collision_src / rehash_collision_indices) = C++ rehashContext_.
-    // Two-pass: pass 1 sequential scan of old chunks + insert; pass 2+ iterate
+    // Two-pass: pass 1 sequential scan of segment + insert; pass 2+ iterate
     // collisions with collisionBatch++. Insert-only (no key compare during rehash).
-    fn rehash_batch(&mut self, old_chunks: *mut Chunk, old_num: usize) {
-        // ResetRehashContext: gather src (hash,value) + initial target positions.
-        // (C++ visitor walks old chunks lazily; here we materialize once into the
-        //  reused member buffers, keeping the same two-pass collision structure.)
+    fn rehash_batch(&mut self, old_chunks: *mut Chunk, from_chunk: usize, end_chunk: usize) {
+        // ResetRehashContext: gather src (hash,value) + initial target positions
+        // for this segment only.
         self.rehash_collision_src.clear();
         self.rehash_hash_vals.clear();
         self.rehash_positions.clear();
-        for ci in 0..old_num {
+        for ci in from_chunk..end_chunk {
             let chunk = unsafe { &*old_chunks.add(ci) };
             for slot_idx in 0..SLOTS_PER_CHUNK {
                 if chunk.tags[slot_idx] != 0x80 {
