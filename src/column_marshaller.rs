@@ -385,9 +385,8 @@ impl TaperColumnSerializeHandler {
         let n = hashes.len();
         if n == 0 { return; }
 
-        // No capacity check here — caller must pass sufficient initial_capacity
-        // to TaperColumnSerializeHandler::new() so that no rehash occurs.
-        // This matches rust-taper-hashmap2 behavior.
+        // No per-batch reserve: emplace_batch_impl rehashes internally when the
+        // load factor is exceeded (matches OmniOperator ExpandCapacityIteratively).
 
         // Reuse buffers (mirrors C++ class member resize pattern)
         self.groups.resize(n, std::ptr::null());

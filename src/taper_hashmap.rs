@@ -88,6 +88,8 @@ impl TaperHashMap {
         self.size as f64 >= self.capacity() as f64 * LOAD_FACTOR_THRESHOLD
     }
 
+
+
     #[inline(always)]
     fn chunk_pos(&self, hash: u64) -> usize {
         (hash as usize) & self.mask
